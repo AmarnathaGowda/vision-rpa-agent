@@ -32,7 +32,7 @@ def session_store():
     from tests.fixtures.mock_session import make_test_session
     store = make_test_session()
     yield store
-    store._conn.close()
+    store.conn.close()
 
 
 @pytest.fixture

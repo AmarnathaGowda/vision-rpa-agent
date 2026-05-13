@@ -4,13 +4,13 @@ import sqlite3
 
 
 def make_test_session():
-    """Return a fully initialised SessionStore backed by :memory:."""
-    from memory.session import SessionStore
+    """Return a fully initialised SessionMemory backed by :memory:."""
+    from memory.session import SessionMemory
 
-    store = SessionStore.__new__(SessionStore)
+    store = SessionMemory.__new__(SessionMemory)
     store.db_path = ":memory:"
-    store._conn = sqlite3.connect(":memory:", check_same_thread=False)
-    store._conn.execute("PRAGMA journal_mode=WAL")
-    store._conn.row_factory = sqlite3.Row
-    store._init_schema()
+    store.conn = sqlite3.connect(":memory:", check_same_thread=False)
+    store.conn.execute("PRAGMA journal_mode=WAL")
+    store.conn.row_factory = sqlite3.Row
+    store._create_schema()
     return store

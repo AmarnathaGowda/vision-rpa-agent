@@ -73,3 +73,28 @@ def test_mock_llm_fixture():
     import json
     data = json.loads(resp.choices[0].message.content)
     assert data["app_type"] == "browser"
+
+
+def test_session_store_fixture(session_store):
+    from memory.working import WorkingMemory
+    wm = WorkingMemory(task_id="s1", task_type="case1", goal="g", agent_id="a1")
+    session_store.write_checkpoint("s1", 0, wm)
+    checkpoint = session_store.load_checkpoint("s1")
+    assert checkpoint is not None
+    assert checkpoint["task_id"] == "s1"
+    assert checkpoint["step"] == 0
+
+
+def test_session_store_hitl_write(session_store):
+    hitl_id = session_store.write_hitl(
+        task_id="s2", agent_id="a1", reason="low confidence",
+        screenshot="", context={"field": "claim_id"},
+    )
+    assert isinstance(hitl_id, int)
+    result = session_store.poll_hitl("s2")
+    assert result is None  # still pending
+
+
+def test_session_store_get_running_tasks(session_store):
+    rows = session_store.get_running_tasks("a1")
+    assert isinstance(rows, list)
