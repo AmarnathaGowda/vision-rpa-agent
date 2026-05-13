@@ -1,0 +1,86 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$FILE\" == *.py ]]; then cd /Users/abc/Desktop/Drive_Data/vision-rpa-agent && poetry run ruff check --fix \"$FILE\" --quiet 2>/dev/null && poetry run ruff format \"$FILE\" --quiet 2>/dev/null; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$FILE\" == *.py ]] && [[ \"$FILE\" == */memory/* || \"$FILE\" == */agent/* || \"$FILE\" == */executors/* || \"$FILE\" == */hitl/* ]]; then cd /Users/abc/Desktop/Drive_Data/vision-rpa-agent && poetry run mypy \"$FILE\" --ignore-missing-imports --no-error-summary 2>/dev/null | grep -E 'error:|warning:' | head -5 || true; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CMD=\"$CLAUDE_TOOL_INPUT_COMMAND\"; if echo \"$CMD\" | grep -qE 'pyautogui\\.click\\([0-9]|pyautogui\\.moveTo\\([0-9]'; then echo '[HOOK BLOCK] Pixel-coordinate pyautogui calls are not allowed in this project. Use Playwright selectors (browser) or pywinauto UIA (desktop).'; exit 1; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CMD=\"$CLAUDE_TOOL_INPUT_COMMAND\"; if echo \"$CMD\" | grep -qE 'git add.*\\.env|git add -A|git add \\.'  && echo \"$CMD\" | grep -qv 'env\\.example'; then echo '[HOOK BLOCK] Refusing git add that may stage .env or credential files. Stage specific files by name (e.g. git add config/settings.py).'; exit 1; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; CONTENT=\"$CLAUDE_TOOL_INPUT_NEW_STRING$CLAUDE_TOOL_INPUT_CONTENT\"; if echo \"$CONTENT\" | grep -qE 'anthropic\\.Anthropic|from anthropic import|import anthropic'; then echo '[HOOK WARN] anthropic SDK detected. This project uses on-prem LLM only (Ollama/vLLM). Use openai SDK with INFERENCE_URL pointing to local server.'; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CONTENT=\"$CLAUDE_TOOL_INPUT_NEW_STRING$CLAUDE_TOOL_INPUT_CONTENT\"; if echo \"$CONTENT\" | grep -qE 'confidence[[:space:]]*=[[:space:]]*0\\.[0-9]+' && ! echo \"$CONTENT\" | grep -qE 'confidence_threshold|financial_confidence_threshold|CONFIDENCE_'; then echo '[HOOK WARN] Hardcoded confidence value detected. Use settings.confidence_threshold (0.75) or settings.financial_confidence_threshold (0.90) — never inline magic numbers for thresholds.'; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/abc/Desktop/Drive_Data/vision-rpa-agent && CHANGED=$(git diff --name-only 2>/dev/null | grep '\\.py$' | head -3); if [ -n \"$CHANGED\" ]; then echo \"[HOOK] Modified Python files — run tests before committing:\"; echo \"$CHANGED\"; echo \"  poetry run pytest tests/ -q\"; fi"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(poetry run ruff*)",
+      "Bash(poetry run mypy*)",
+      "Bash(poetry run pytest*)",
+      "Bash(poetry run python*)",
+      "Bash(ollama*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(find /Users/abc/Desktop/Drive_Data/vision-rpa-agent*)",
+      "Bash(ls /Users/abc/Desktop/Drive_Data/vision-rpa-agent*)"
+    ]
+  }
+}

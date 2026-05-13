@@ -1,0 +1,7 @@
+# Phase 0 exit-criterion task.
+# Run with --skip-preflight so the smoke check does not require Ollama:
+#   poetry run python run_agent.py --task config/tasks/smoke_test.yaml --skip-preflight
+task_id: smoke_test
+task_type: smoke
+goal: "Verify project skeleton imports and runs without error."
+case: none

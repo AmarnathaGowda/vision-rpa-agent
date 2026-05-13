@@ -1,0 +1,53 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────
+.env
+.env.local
+.env.production
+*.key
+*.pem
+credentials.json
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ── Poetry ────────────────────────────────────────────────────────────
+# Keep poetry.lock in git — ensures reproducible installs
+# poetry.lock  ← do NOT add this line
+
+# ── Agent runtime output ──────────────────────────────────────────────
+screenshots/
+downloads/
+videos/
+logs/
+data/db/
+data/chroma/
+
+# ── Test artifacts ────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── Type checking ─────────────────────────────────────────────────────
+.mypy_cache/
+
+# ── IDE ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Playwright ────────────────────────────────────────────────────────
+test-results/
+playwright-report/
