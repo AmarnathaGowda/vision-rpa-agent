@@ -1,38 +1,47 @@
 # Todo List
 
-Current phase: **Phase 0 — Project Setup**
+Current phase: **Phase 2 — Browser Execution (next)**
 
-Last updated: 2026-05-12
-
----
-
-## Active — Phase 0 (Do Now)
-
-- [ ] Create project folder structure
-- [ ] Initialize Poetry project (`pyproject.toml`)
-- [ ] Create `.env.example` with all config keys
-- [ ] Create `config/settings.py` using Pydantic Settings
-- [ ] Create module stub files (all methods raise `NotImplementedError`)
-- [ ] Create `run_agent.py` entry point
-- [ ] Set up structlog + Rich logging
-- [ ] Set up pytest with smoke test
-- [ ] Initialize git repository
-- [ ] Add `.gitignore` for Python, `.env`, screenshots, downloads
-- [ ] Verify all dependencies install cleanly on Windows dev machine
+Last updated: 2026-05-13
 
 ---
 
-## Up Next — Phase 1 (Core Loop + Vision)
+## Completed — Phase 0 (Project Setup)
 
-- [ ] `memory/working.py` — typed in-process working memory
-- [ ] `agent/loop.py` — observe → reason → act → store skeleton
-- [ ] `agent/perception.py` — mss capture + Pillow preprocess
-- [ ] Claude Vision integration — ScreenState JSON
-- [ ] `agent/planner.py` — ActionPlan via Claude LLM
-- [ ] Confidence threshold check → HITL routing
-- [ ] Max loop step guard
-- [ ] Audit log writer
-- [ ] Unit tests for perception and planner
+- [x] Create project folder structure
+- [x] Initialize Poetry project (`pyproject.toml`)
+- [x] Create `.env.example` with all config keys
+- [x] Create `config/settings.py` using Pydantic Settings
+- [x] Create module stub files (all methods raise `NotImplementedError`)
+- [x] Create `run_agent.py` entry point (loads task YAML, supports `--skip-preflight`)
+- [x] Set up structlog + Rich logging (`config/logging_config.py`)
+- [x] Set up pytest with smoke test
+- [x] Initialize git repository (initial commit `73013b8`)
+- [x] Add `.gitignore` for Python, `.env`, screenshots, downloads
+- [ ] Verify all dependencies install cleanly on Windows dev machine — pending (current dev box is macOS)
+
+---
+
+## Completed — Phase 1 (Core Loop + Vision)
+
+- [x] `memory/working.py` — typed in-process working memory
+- [x] `agent/loop.py` — observe → reason → act → store cycle with stub executor
+- [x] `agent/perception.py` — mss capture + Pillow preprocess + local VLM call
+- [x] Local VLM integration — ScreenState JSON (Ollama/vLLM via OpenAI client; no external APIs per CLAUDE.md)
+- [x] `agent/planner.py` — ActionPlan via local LLM
+- [x] `agent/schemas.py` — ScreenState / ActionPlan / ActionResult Pydantic models
+- [x] Confidence threshold check → HITL routing (`SessionMemory.write_hitl`)
+- [x] Max loop step guard (`settings.max_loop_steps`)
+- [x] Retry-limit guard → forced `flag_human`
+- [x] Audit log writer (`agent/audit.py`, append-only NDJSON)
+- [x] Unit tests for schemas / perception / planner / loop (mocked VLM)
+- [ ] Real-screen end-to-end validation on Windows box w/ Ollama — pending hardware
+
+Notes / assumptions:
+- Roadmap originally said "Claude Vision API"; CLAUDE.md non-negotiable forbids external LLMs.
+  Phase 1 is implemented against the local OpenAI-compatible endpoint (Ollama dev, vLLM prod).
+- `executors/*` and `memory/knowledge.py` remain stubs; `StubExecutor` returns `deferred`.
+- `mss` only imports inside `PerceptionLayer.capture()` — keeps unit tests runnable headless.
 
 ---
 

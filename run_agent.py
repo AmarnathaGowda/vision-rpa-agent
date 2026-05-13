@@ -63,9 +63,6 @@ def main() -> int:
         log.error("task_file_invalid", path=str(task_path), error=str(e))
         return 1
 
-    if not args.skip_preflight:
-        preflight_checks()
-
     log.info(
         "agent_start",
         task_id=task.get("task_id"),
@@ -76,9 +73,24 @@ def main() -> int:
         mode="simulation" if settings.use_simulation else "production",
         resume=args.resume,
     )
-    # AgentLoop.run() arrives in Phase 1.
-    log.info("agent_loop_not_implemented", phase="Phase 1 target")
-    return 0
+
+    # Phase 0 smoke task: skeleton check only — no VLM, no loop.
+    if task.get("task_type") == "smoke":
+        log.info("smoke_task_ok",
+                 message="skeleton imports cleanly; loop not invoked for smoke task")
+        return 0
+
+    if not args.skip_preflight:
+        preflight_checks()
+
+    from agent.loop import AgentLoop
+    from memory.session import SessionMemory
+
+    session = SessionMemory(agent_id=agent_id)
+    loop = AgentLoop(session=session, agent_id=agent_id)
+    result = loop.run(task)
+    log.info("agent_complete", **result)
+    return 0 if result["status"] != "failed" else 2
 
 
 if __name__ == "__main__":

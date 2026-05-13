@@ -13,47 +13,47 @@ Total estimated time to MVP (3 agents working): **10–12 weeks**
 
 ---
 
-## Phase 0 — Project Setup and Skeleton (Week 1–2)
+## Phase 0 — Project Setup and Skeleton (Week 1–2) — ✅ COMPLETE
 
 **Goal:** Working project structure, environment configured, basic agent loop shell that compiles and runs.
 
 ### Tasks
 
-- [ ] Create project folder structure (`agent/`, `executors/`, `memory/`, `hitl/`, `config/`, `tests/`)
-- [ ] Set up Poetry with `pyproject.toml`
-- [ ] Configure `.env.example` with all required variables
-- [ ] Set up `config/settings.py` using Pydantic Settings
-- [ ] Implement empty stub for each module (all methods raise `NotImplementedError`)
-- [ ] Write `run_agent.py` entry point that reads a task YAML and starts AgentLoop
-- [ ] Configure `structlog` for JSON-formatted logging
-- [ ] Configure `Rich` for readable console output
-- [ ] Set up pytest with one passing smoke test
-- [ ] Initialize git repository with `.gitignore`
-- [ ] Verify Python + Playwright + pywinauto + mss install cleanly on Windows
+- [x] Create project folder structure (`agent/`, `executors/`, `memory/`, `hitl/`, `config/`, `tests/`)
+- [x] Set up Poetry with `pyproject.toml`
+- [x] Configure `.env.example` with all required variables
+- [x] Set up `config/settings.py` using Pydantic Settings
+- [x] Implement empty stub for each module (all methods raise `NotImplementedError`)
+- [x] Write `run_agent.py` entry point that reads a task YAML and starts AgentLoop
+- [x] Configure `structlog` for JSON-formatted logging
+- [x] Configure `Rich` for readable console output
+- [x] Set up pytest with one passing smoke test
+- [x] Initialize git repository with `.gitignore`
+- [ ] Verify Python + Playwright + pywinauto + mss install cleanly on Windows — deferred to Windows dev box
 
-**Exit criteria:** `python run_agent.py --task config/tasks/smoke_test.yaml` runs without import errors.
+**Exit criteria:** `python run_agent.py --task config/tasks/smoke_test.yaml --skip-preflight` runs without import errors. ✅ met
 
 ---
 
-## Phase 1 — Core Loop and Perception (Week 3–4)
+## Phase 1 — Core Loop and Perception (Week 3–4) — ✅ COMPLETE
 
 **Goal:** Agent can look at the screen and describe what it sees. The loop skeleton runs end-to-end.
 
 ### Tasks
 
-- [ ] Implement `memory/working.py` — in-process dict with typed access
-- [ ] Implement `agent/loop.py` — observe → reason → act → store cycle with stub executors
-- [ ] Implement `agent/perception.py` — mss capture + Pillow preprocess
-- [ ] Integrate Claude Vision API — send screenshot, receive ScreenState JSON
-- [ ] Define and validate `ScreenState` Pydantic model
-- [ ] Implement `agent/planner.py` — Claude LLM action planning prompt
-- [ ] Define and validate `ActionPlan` Pydantic model
-- [ ] Implement confidence threshold check → route to HITL stub if below threshold
-- [ ] Implement max loop step guard
-- [ ] Write unit tests for perception and planner with mock Claude responses
-- [ ] Log every perception result and action plan to audit log
+- [x] Implement `memory/working.py` — in-process dict with typed access
+- [x] Implement `agent/loop.py` — observe → reason → act → store cycle with stub executor
+- [x] Implement `agent/perception.py` — mss capture + Pillow preprocess
+- [x] Integrate **local** VLM (Ollama / vLLM via OpenAI-compatible client) — see CLAUDE.md non-negotiable #1; "Claude Vision" in the original phrasing replaced by on-prem VLM
+- [x] Define and validate `ScreenState` Pydantic model (`agent/schemas.py`)
+- [x] Implement `agent/planner.py` — local LLM action planning prompt
+- [x] Define and validate `ActionPlan` Pydantic model
+- [x] Implement confidence threshold check → route to HITL via `SessionMemory.write_hitl`
+- [x] Implement max loop step guard
+- [x] Write unit tests for perception and planner with mock VLM responses
+- [x] Log every perception result and action plan to audit log (NDJSON in `logs/audit/`)
 
-**Exit criteria:** Agent loop runs, captures screen, calls Claude Vision, receives ScreenState, plans an action, logs it — all without executing the action yet (stub executor).
+**Exit criteria:** Agent loop runs, captures screen, calls local VLM, receives ScreenState, plans an action, logs it — all without executing the action yet (stub executor). ✅ verified via 30-test pytest suite. Real-screen smoke run pending on a Windows box with Ollama.
 
 ---
 

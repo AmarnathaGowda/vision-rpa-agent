@@ -1,12 +1,17 @@
-"""ChromaDB long-term knowledge store — UI patterns and error recoveries."""
+"""ChromaDB long-term knowledge store — UI patterns and error recoveries.
+
+`chromadb` is a Phase 4 dependency. Install with `poetry install --with phase4`
+when ready to use. The module imports cleanly without it — only
+`KnowledgeStore()` requires it at runtime.
+"""
 from __future__ import annotations
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 from config.settings import settings
 
 
 class KnowledgeStore:
     def __init__(self) -> None:
+        import chromadb  # deferred — see module docstring
+        from chromadb.config import Settings as ChromaSettings
         self.client = chromadb.PersistentClient(
             path=settings.chroma_path,
             settings=ChromaSettings(anonymized_telemetry=False),

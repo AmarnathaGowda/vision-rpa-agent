@@ -1,0 +1,65 @@
+"""Pydantic models for the observe → reason → act → store loop."""
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+AppType = Literal["browser", "desktop", "rdp", "file_explorer", "dialog", "unknown"]
+TaskProgress = Literal["not_started", "in_progress", "blocked", "complete"]
+ActionType = Literal[
+    "click", "type", "navigate", "read", "extract", "wait",
+    "flag_human", "js_eval", "noop",
+]
+
+
+class VisibleElement(BaseModel):
+    label: str = ""
+    type: str = ""
+    testid: str = ""
+
+
+class ScreenState(BaseModel):
+    app_type: AppType = "unknown"
+    state_summary: str = ""
+    current_url: str = ""
+    visible_elements: list[VisibleElement] = Field(default_factory=list)
+    error_present: bool = False
+    blocking_modal: bool = False
+    task_progress: TaskProgress = "in_progress"
+    blocking_issue: str | None = None
+    confidence: float = 0.0
+
+    @field_validator("confidence")
+    @classmethod
+    def _conf_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"confidence must be in [0,1], got {v}")
+        return v
+
+
+class ActionPlan(BaseModel):
+    action_type: ActionType
+    target: str = ""
+    value: str = ""
+    reason: str = ""
+    confidence: float = 0.0
+    fallback: str = ""
+    is_financial: bool = False
+    requires_hitl: bool = False
+    cache_hit: bool = False
+
+    @field_validator("confidence")
+    @classmethod
+    def _conf_range(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"confidence must be in [0,1], got {v}")
+        return v
+
+
+class ActionResult(BaseModel):
+    status: Literal["ok", "skipped", "failed", "deferred"] = "skipped"
+    error_msg: str = ""
+    extracted_value: str = ""
+    duration_ms: int = 0
+    screenshot_path: str = ""

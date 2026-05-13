@@ -40,7 +40,11 @@ pandas      = "^2.0"
 rapidfuzz   = "^3.0"
 
 # ── Memory / storage ──────────────────────────────────────────────────
-chromadb    = "^0.5"
+# chromadb is installed only when needed (Phase 4) via the "phase4" extra:
+#   poetry install --with phase4
+# Kept out of the default set because onnxruntime (its transitive dep) has
+# no wheel for some Python/OS combos (e.g. macOS x86_64 + py3.11) and would
+# block the rest of the install.
 
 # ── Config / validation ───────────────────────────────────────────────
 pydantic          = "^2.0"
@@ -70,6 +74,12 @@ pytest-playwright = "^0.5"
 black             = "^24.0"
 ruff              = "^0.4"
 mypy              = "^1.10"
+
+[tool.poetry.group.phase4]
+optional = true
+
+[tool.poetry.group.phase4.dependencies]
+chromadb = "^0.5"
 
 [tool.ruff]
 line-length = 100
