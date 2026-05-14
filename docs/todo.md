@@ -1,6 +1,6 @@
 # Todo List
 
-Current phase: **Phase 4 — Extraction + Memory (next)**
+Current phase: **Phase 5 — HITL + 3-Agent Parallel (next)**
 
 Last updated: 2026-05-13
 
@@ -88,11 +88,14 @@ End-to-end validation on macOS dev box:
 
 ---
 
-## Queued — Phase 4 (PDF + Memory)
+## Completed — Phase 4 (PDF + Memory)
 
-- [ ] `executors/extraction.py` — full pipeline
-- [ ] `memory/knowledge.py` — ChromaDB
-- [ ] `executors/file_ops.py` — file locking, Excel, copy-to-local
+- [x] `executors/extraction.py` — `ExtractionPipeline` with three tiers (pdfplumber 0.92 conf → Tesseract OCR 0.78 → local VLM ≤0.81). `FieldSpec` carries aliases + regex + financial flag. Per-field gating: failed fields land in `result.fields` with `confidence=0.0, hitl_required=True`.
+- [x] `memory/knowledge.py` — `KnowledgeStore` Protocol + `ChromaKnowledgeStore` (real, persistent, buffered writes flushed at end-of-task per CLAUDE.md) + `NullKnowledgeStore` (no-op fallback when `chromadb` isn't installed). `get_knowledge_store()` picks at runtime.
+- [x] `executors/file_ops.py` Excel ops — `read_excel` (list-of-dicts, blank-row skip, retry on `OSError`), `write_excel` (atomic via `.tmp` + replace, overwrite guard), `update_excel_cell` (column letter or 1-based index).
+- [x] `extract_pdf` + `read_excel` action types routed to `FileExecutor` via `ActionRouter`.
+- [x] `config/tasks/extract_pdf.yaml` task YAML.
+- [x] Tests: 9 extraction, 10 knowledge, 7 Excel — all passing without a live VLM/chromadb (real openpyxl + Pillow used; chromadb behind a faithful fake client).
 
 ---
 

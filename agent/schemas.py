@@ -13,8 +13,8 @@ ActionType = Literal[
     "flag_human", "js_eval", "noop",
     # Desktop / dropdown
     "select_option",
-    # File Explorer / shared folder
-    "file_navigate", "file_open",
+    # File Explorer / shared folder / extraction pipeline
+    "file_navigate", "file_open", "extract_pdf", "read_excel",
     # RDP lifecycle
     "rdp_launch", "rdp_disconnect", "rdp_reconnect",
 ]

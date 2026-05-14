@@ -1,0 +1,17 @@
+# PDF extraction pipeline demo.
+#
+# `value` carries the comma-separated field names to extract. Each field
+# is tried against tier 1 (pdfplumber) → tier 2 (Tesseract OCR) → tier 3
+# (local VLM). Fields below their confidence threshold get
+# hitl_required=True in the result JSON.
+task_id: extract_demo
+task_type: case4
+app: file
+goal: "Extract loan_number, status, and amount from a claim PDF."
+
+steps:
+  - action_type: extract_pdf
+    target: "tests/sim/fixtures/sample_claim.pdf"
+    value: "loan_number,status,amount"
+    is_financial: true
+    reason: "extract structured fields from the claim PDF"

@@ -28,9 +28,11 @@ ROUTING_TABLE: dict[str, str] = {
     "js_eval":  "browser",
     # Desktop-only
     "select_option": "desktop",
-    # File Explorer / network share
+    # File Explorer / network share / extraction
     "file_navigate": "file",
     "file_open":     "file",
+    "extract_pdf":   "file",
+    "read_excel":    "file",
     # RDP lifecycle
     "rdp_launch":     "rdp",
     "rdp_reconnect":  "rdp",

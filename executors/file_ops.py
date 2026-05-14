@@ -46,11 +46,13 @@ class FileExecutor:
 
     def __init__(self, desktop: "DesktopExecutor | None" = None,
                  download_dir: str | None = None,
+                 extraction_pipeline=None,
                  _subprocess_run=subprocess.run) -> None:
         self.desktop = desktop
         self.download_dir = Path(download_dir or settings.download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self._run = _subprocess_run
+        self._extraction = extraction_pipeline  # injectable; built lazily
 
     # ── ActionRouter contract ───────────────────────────────────────────────
     def execute(self, plan: ActionPlan) -> ActionResult:
@@ -60,6 +62,21 @@ class FileExecutor:
                 self.open_in_explorer(plan.target)
             elif plan.action_type == "file_open":
                 self.open_file(plan.target)
+            elif plan.action_type == "extract_pdf":
+                # plan.target = path, plan.value = comma-separated field names
+                fields = [f.strip() for f in (plan.value or "").split(",") if f.strip()]
+                summary = self.extract_pdf(plan.target, fields)
+                return ActionResult(
+                    status="ok", extracted_value=summary,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+            elif plan.action_type == "read_excel":
+                rows = self.read_excel(plan.target)
+                import json
+                return ActionResult(
+                    status="ok", extracted_value=json.dumps(rows[:10]),
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
             elif plan.action_type in ("read", "extract"):
                 value = self.read_text_file(plan.target)
                 return ActionResult(
@@ -159,6 +176,102 @@ class FileExecutor:
         else:
             self._run(["xdg-open", file_path], check=False)
         log.info("file_open", path=file_path)
+
+    # ── Excel ──────────────────────────────────────────────────────────────
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(0.5),
+           retry=retry_if_exception_type(OSError), reraise=True)
+    def read_excel(self, path: str | Path, sheet: str | None = None,
+                   header_row: int = 1) -> list[dict]:
+        """Read an .xlsx into a list-of-dicts. ``header_row`` is 1-based."""
+        try:
+            import openpyxl
+        except ImportError as e:
+            raise FileError("openpyxl not installed (poetry install)") from e
+        path = Path(path)
+        if not path.exists():
+            raise FileError(f"file does not exist: {path}")
+
+        wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+        try:
+            ws = wb[sheet] if sheet else wb.worksheets[0]
+            rows_iter = ws.iter_rows(values_only=True)
+            header = None
+            out: list[dict] = []
+            for idx, row in enumerate(rows_iter, start=1):
+                if idx < header_row:
+                    continue
+                if idx == header_row:
+                    header = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(row)]
+                    continue
+                if header is None:
+                    continue
+                if all(c is None for c in row):
+                    continue
+                out.append({header[i]: row[i] for i in range(min(len(header), len(row)))})
+            log.info("excel_read", path=str(path), sheet=ws.title, rows=len(out))
+            return out
+        finally:
+            wb.close()
+
+    def write_excel(self, path: str | Path, rows: list[dict],
+                    sheet: str = "Sheet1", overwrite: bool = True) -> Path:
+        """Write a list-of-dicts to an .xlsx. Atomically replaces destination."""
+        try:
+            import openpyxl
+        except ImportError as e:
+            raise FileError("openpyxl not installed (poetry install)") from e
+        path = Path(path)
+        if path.exists() and not overwrite:
+            raise FileError(f"refusing to overwrite existing file: {path}")
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet
+        if rows:
+            header = list(rows[0].keys())
+            ws.append(header)
+            for r in rows:
+                ws.append([r.get(h) for h in header])
+
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        wb.save(str(tmp))
+        tmp.replace(path)
+        log.info("excel_write", path=str(path), rows=len(rows))
+        return path
+
+    def update_excel_cell(self, path: str | Path, sheet: str,
+                          row: int, column: int | str, value) -> None:
+        """1-based row / column (or column letter). Loads, edits, saves in place."""
+        try:
+            import openpyxl
+            from openpyxl.utils import column_index_from_string
+        except ImportError as e:
+            raise FileError("openpyxl not installed") from e
+        col_idx = column_index_from_string(column) if isinstance(column, str) else column
+        wb = openpyxl.load_workbook(str(path))
+        try:
+            ws = wb[sheet]
+            ws.cell(row=row, column=col_idx, value=value)
+            wb.save(str(path))
+            log.info("excel_update", path=str(path), sheet=sheet, row=row, column=column)
+        finally:
+            wb.close()
+
+    # ── PDF extraction (Phase 4 pipeline) ──────────────────────────────────
+    def extract_pdf(self, path: str | Path, fields: list[str] | list[dict]) -> str:
+        """Run the three-tier extraction pipeline and return a JSON summary."""
+        import json
+        from executors.extraction import ExtractionPipeline
+        if self._extraction is None:
+            self._extraction = ExtractionPipeline()
+        result = self._extraction.extract(path, fields)
+        return json.dumps({
+            "document": result.document,
+            "tiers_used": result.tiers_used,
+            "pages": result.pages,
+            "fields": {k: v.model_dump() for k, v in result.fields.items()},
+            "duration_ms": result.duration_ms,
+        })
 
     # ── helpers used by extraction pipeline (Phase 4) ──────────────────────
     @staticmethod
