@@ -155,3 +155,152 @@ def test_pick_match_returns_first_captured_group():
     import re
     m = re.search(r"(\d{4})-(\d{2})", "Issued 2026-05")
     assert _pick_match(m) == "2026"
+
+
+# ── multi-page VLM tier ────────────────────────────────────────────────────
+def _multi_page_vlm_client(page_responses: dict[int, dict]):
+    """Build a mock VLM client that returns different JSON for each page.
+
+    ``page_responses`` maps 1-based page number → JSON dict to return.
+    Page detection is via the base64 length suffix on the data URL (unique
+    per page render in our stubs).
+    """
+    import json
+    client = MagicMock()
+    call_counter = {"i": 0}
+    # Yield one response per call in insertion order.
+    ordered = list(page_responses.values())
+
+    def create(**kwargs):
+        idx = call_counter["i"]
+        call_counter["i"] += 1
+        payload = ordered[idx] if idx < len(ordered) else {}
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = json.dumps(payload)
+        return resp
+
+    client.chat.completions.create = MagicMock(side_effect=create)
+    return client
+
+
+def _stub_fitz_multi(n_pages: int):
+    """fitz mock for ``n_pages`` pages — every load_page returns a real PNG."""
+    fitz = MagicMock()
+    doc = MagicMock()
+    doc.page_count = n_pages
+
+    def load_page(idx):
+        page = MagicMock()
+        pix = MagicMock()
+        pix.tobytes.return_value = _real_png_bytes()
+        page.get_pixmap.return_value = pix
+        return page
+
+    doc.load_page.side_effect = load_page
+    fitz.open.return_value = doc
+    return fitz
+
+
+def test_vlm_finds_field_on_page_two(tmp_path):
+    """Field absent on page 1 must be located on page 2 when budget allows."""
+    pdf = tmp_path / "multi.pdf"; pdf.write_bytes(b"%PDF-1.4\n")
+    pdfp = _stub_pdfplumber(["", ""])     # tier 1 returns blanks for both pages
+    fitz = _stub_fitz_multi(2)
+    tess = MagicMock(image_to_string=MagicMock(return_value=""))   # tier 2 also empty
+    vlm = _multi_page_vlm_client({
+        1: {"loan_number": {"value": None, "confidence": 0.0, "location_hint": ""}},
+        2: {"loan_number": {"value": "0156312522", "confidence": 0.85,
+                            "location_hint": "page 2 footer"}},
+    })
+    pipe = ExtractionPipeline(vlm_client=vlm, _pdfplumber=pdfp,
+                              _fitz=fitz, _tesseract=tess)
+    result = pipe.extract(pdf, [FieldSpec(name="loan_number", aliases=["Loan Number"])])
+
+    fx = result.fields["loan_number"]
+    assert fx.value == "0156312522"
+    assert fx.method == "vlm"
+    assert "page 2" in fx.location_hint
+    # Two VLM calls — one per page.
+    assert vlm.chat.completions.create.call_count == 2
+
+
+def test_vlm_respects_max_pages_budget(tmp_path, monkeypatch):
+    """A 10-page PDF with budget=3 must NOT scan past page 3 — field stays in HITL."""
+    from config.settings import settings as s
+    monkeypatch.setattr(s, "vlm_max_pages", 3)
+
+    pdf = tmp_path / "long.pdf"; pdf.write_bytes(b"%PDF-1.4\n")
+    pdfp = _stub_pdfplumber([""] * 10)
+    fitz = _stub_fitz_multi(10)
+    tess = MagicMock(image_to_string=MagicMock(return_value=""))
+    # Field doesn't appear in any of the first 3 pages; it's on page 8 but
+    # the budget cuts us off before we get there.
+    vlm = _multi_page_vlm_client({
+        i: {"loan_number": {"value": None, "confidence": 0.0}}
+        for i in (1, 2, 3)
+    })
+    pipe = ExtractionPipeline(vlm_client=vlm, _pdfplumber=pdfp,
+                              _fitz=fitz, _tesseract=tess)
+    result = pipe.extract(pdf, [FieldSpec(name="loan_number", aliases=["Loan Number"])])
+
+    fx = result.fields["loan_number"]
+    assert fx.value is None
+    assert fx.confidence == 0.0
+    assert fx.hitl_required is True
+    # Exactly 3 VLM calls — the budget.
+    assert vlm.chat.completions.create.call_count == 3
+
+
+def test_vlm_per_spec_pages_hint_skips_other_pages(tmp_path):
+    """FieldSpec(pages=[3]) must scan ONLY page 3, not pages 1 or 2."""
+    pdf = tmp_path / "doc.pdf"; pdf.write_bytes(b"%PDF-1.4\n")
+    pdfp = _stub_pdfplumber([""] * 5)
+    fitz = _stub_fitz_multi(5)
+    tess = MagicMock(image_to_string=MagicMock(return_value=""))
+    vlm = _multi_page_vlm_client({
+        3: {"amount": {"value": "$10,640.58", "confidence": 0.95,
+                       "location_hint": "page 3"}},
+    })
+    pipe = ExtractionPipeline(vlm_client=vlm, _pdfplumber=pdfp,
+                              _fitz=fitz, _tesseract=tess)
+    result = pipe.extract(pdf, [
+        FieldSpec(name="amount", aliases=["Amount"], pages=[3], is_financial=True),
+    ])
+
+    fx = result.fields["amount"]
+    assert fx.value == "$10,640.58"
+    # Exactly ONE VLM call — only page 3 was sent.
+    assert vlm.chat.completions.create.call_count == 1
+
+
+def test_vlm_stops_calling_once_all_specs_found(tmp_path):
+    """If page 1 satisfies every spec at sufficient confidence, page 2 is never sent."""
+    pdf = tmp_path / "doc.pdf"; pdf.write_bytes(b"%PDF-1.4\n")
+    pdfp = _stub_pdfplumber([""] * 3)
+    fitz = _stub_fitz_multi(3)
+    tess = MagicMock(image_to_string=MagicMock(return_value=""))
+    vlm = _multi_page_vlm_client({
+        1: {"status": {"value": "Open", "confidence": 0.95, "location_hint": "page 1"}},
+    })
+    pipe = ExtractionPipeline(vlm_client=vlm, _pdfplumber=pdfp,
+                              _fitz=fitz, _tesseract=tess)
+    result = pipe.extract(pdf, [FieldSpec(name="status", aliases=["Status"])])
+
+    assert result.fields["status"].value == "Open"
+    # Only one VLM call — page 1 satisfied everyone, so pages 2 and 3 skipped.
+    assert vlm.chat.completions.create.call_count == 1
+
+
+def test_vlm_page_order_prioritises_hinted_pages():
+    """Page hints from any spec come first in the iteration order."""
+    specs = [
+        FieldSpec(name="a", pages=[4]),
+        FieldSpec(name="b"),          # no hint
+        FieldSpec(name="c", pages=[2]),
+    ]
+    order = ExtractionPipeline._vlm_page_order(specs, total_pages=6)
+    # Hinted pages first (4 then 2), then 1, 3, 5 (filling budget of 5).
+    assert order[:2] == [4, 2]
+    # All hinted pages present in the head of the order.
+    assert 4 in order and 2 in order

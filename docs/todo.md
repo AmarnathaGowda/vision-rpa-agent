@@ -1,8 +1,8 @@
 # Todo List
 
-Current phase: **Phase 5 — HITL + 3-Agent Parallel (next)**
+Current phase: **Phase 6 — Hardening** (Phase 5 complete)
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
 ---
 
@@ -99,25 +99,40 @@ End-to-end validation on macOS dev box:
 
 ---
 
-## Known Gaps — Phase 3/4 (Carry-Forward)
+## Completed — Phase 4.5 (Critical Hardening)
 
-The following were identified during Phase 3/4 validation and are intentionally deferred:
+All four architectural defects from the senior-architect review closed before Phase 5 began. Phase 5's HITL dashboard now receives typed `RecoveryDirective.reason` values for blocking modals, RDP disconnects, transient errors, and reconnect-limit escalations.
 
-- [ ] **`RecoveryHandler` not wired into `AgentLoop`** — `agent/recovery.py` is fully implemented and tested in isolation, but `AgentLoop._run_loop()` never calls `recovery.detect(screen, working)` (before reasoning) or `recovery.recover(plan, result, working)` (after a failed action). Blocking modal auto-dismiss, RDP auto-reconnect, and transient-error retry routing are therefore inactive at runtime. Basic HITL escalation still functions via the planner's `_enforce_hitl_rules`. Wire in Phase 5 when the loop gains checkpoint-resume and multi-agent isolation. Tracked in: `agent/recovery.py` + `agent/loop.py._run_loop()`.
-- [ ] **`DesktopExecutor._window` auto-attach may hang on macOS/Linux CI** — `_window()` calls `self.attach()` when the window isn't in `_apps`, which blocks for `DEFAULT_TIMEOUT_S`. This is correct on Windows but can slow down the non-Windows test suite if `title_re` is non-None and no app is pre-seeded. Mitigated by always pre-seeding `_apps` in tests.
-- [ ] **`ExtractionPipeline` VLM tier only sends page 1** — Multi-page PDFs send only the first page to the VLM. The `FieldSpec.aliases` page-hint mechanism is stubbed (comment only). Extend `_tier_vlm` to loop over pages when a spec requests a non-first page.
-- [ ] **Windows runtime validation pending** — RDP/desktop/mstsc paths require a Windows host with `pywinauto`, `mss`, and the App VM accessible. Tracked in `docs/assumptions.md` A-06 / A-08 / A-09 / A-10.
+- [x] **Wired `RecoveryHandler` into `AgentLoop._run_loop()`** — `_apply_directive()` runs both before `_reason()` (detect) and after a failed `_act()` (recover). Bounded by `RETRY_LIMIT=3` recovery attempts per step (`recovery_<step>` counter); exceeding the cap escalates to HITL with the recovery action name in the reason. 6 new integration tests in `tests/test_loop_recovery.py` covering modal-dismiss, RDP-reconnect, transient-retry-then-HITL, unknown-failure-to-HITL, error_present-to-HITL, and the happy-path-no-recovery case.
+- [x] **Consolidated RDP reconnect counters** — `RDPHandler.MAX_RECONNECTS` is now the single source of truth. `RecoveryHandler.max_rdp_reconnects` reads it via a property (with type-check guard to defeat MagicMock auto-attributes in tests), falling back to `DEFAULT_MAX_RDP_RECONNECTS=3` when no handler is provided.
+- [x] **`DesktopExecutor.attach` short-circuits on `DesktopError`** — pywinauto import failures (deterministic on non-Windows) now raise immediately instead of busy-looping for `DEFAULT_TIMEOUT_S=10s`. Regression test asserts the call returns in < 1 second.
+- [x] **`BrowserSession.__exit__` nested try/finally** — every cleanup step (context.close → browser.close → playwright.stop) runs in its own try/finally; a failure in one does not prevent the next. Regression test asserts all three are called even when `context.close()` raises.
+
+Result: 133 tests passing (was 120, +13 from this phase). Live e2e regression of `claim_search.yaml` still completes with `status=success exit_reason=task_complete steps=6`.
 
 ---
 
-## Queued — Phase 5 (HITL + 3 Agents)
+## Known Gaps — Carry-forward (not blocking Phase 5)
 
-- [ ] `hitl/queue.py`
-- [ ] `hitl/server.py` dashboard
-- [ ] Agent checkpoint resume after HITL
-- [ ] 3-agent parallel test
-- [ ] HITL dashboard multi-agent view
-- [ ] Wire `RecoveryHandler` into `AgentLoop._run_loop()` (see carry-forward above)
+- [x] **`ExtractionPipeline` VLM tier multi-page** — RESOLVED 2026-05-14. `_tier_vlm` now iterates up to `settings.vlm_max_pages` pages, batches all pending specs per page, and stops early as specs are found. `FieldSpec.pages` accepts explicit hints. 5 new integration tests. (A-16 closed.)
+- [ ] **Windows runtime validation pending** — RDP/desktop/mstsc paths require a Windows host with `pywinauto`, `mss`, and the App VM accessible. Tracked in `docs/assumptions.md` A-06 / A-08 / A-09 / A-10. Gating step for Phase 3 production, not a code defect.
+
+---
+
+## Completed — Phase 5 (HITL + 3 Agents)
+
+- [x] `hitl/queue.py` — `HITLQueue` with `flag()`, `wait_for_resolution()` (injectable sleep, `HITLTimeoutError`), and `apply_resolution()` covering approve / correct / skip / abort
+- [x] `hitl/server.py` — FastAPI dashboard with multi-agent view: discovers every `data/db/*.db` under `settings.db_dir`, aggregates pending counts, exposes HTML review form + JSON API (`/api/agents`, `/api/agent/{id}/hitl`, `/api/agent/{id}/resolve/{hid}`); binds to 127.0.0.1
+- [x] `hitl/runner.py` — `HITLRunner` supervisor that runs `AgentLoop.run`, blocks on `HITLQueue.wait_for_resolution()` when the loop pauses, applies the resolution to `WorkingMemory`, and calls `AgentLoop.resume()` until task completes or `MAX_RESUMES=10`
+- [x] Agent checkpoint resume after HITL — `AgentLoop.resume()` re-uses the in-process `WorkingMemory`; resolution mutates step/retry counters before resume; SQLite `tasks.status` flips `hitl_wait` → `running` on `SessionMemory.resolve_hitl`
+- [x] 3-agent parallel test — `tests/test_multi_agent.py::test_three_agents_run_in_parallel` spawns 3 threads with isolated `SessionMemory(agent_id=…)`, verifies each completes its own task and that DB + audit dirs are per-agent (`agent_1.db`, `agent_2.db`, `agent_3.db`; same for `.ndjson`)
+- [x] HITL dashboard multi-agent view — `tests/test_multi_agent.py::test_dashboard_aggregates_three_agents` asserts FastAPI dashboard sees all 3 agents and only the targeted agent's pending count drops on resolution
+
+`memory/session.py` gained `list_hitl`, `get_hitl`, `resolve_hitl` to back the dashboard. `tasks.status` returns to `running` automatically when a HITL row is resolved so the runner knows to resume.
+
+Result: **158 tests collected (151 passed, 7 skipped)** — +20 from this phase. Live e2e regression (`config/tasks/claim_search.yaml --skip-preflight`) still completes with `status=success exit_reason=task_complete steps=6`.
+
+---
 
 ---
 

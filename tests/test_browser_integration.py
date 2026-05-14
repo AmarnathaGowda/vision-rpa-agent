@@ -97,6 +97,25 @@ def test_form_fill_and_submit(browser_router):
     assert "Saved successfully" in results[5].extracted_value
 
 
+def test_browser_session_runs_full_cleanup_even_when_context_close_raises(monkeypatch):
+    """If context.close() raises, browser.close() AND _pw.stop() must still run."""
+    from unittest.mock import MagicMock
+    from executors.browser import BrowserSession
+
+    session = BrowserSession(headless=True)
+    # Stub Playwright lifecycle entirely; we only care about cleanup ordering.
+    session._pw = MagicMock()
+    session.context = MagicMock()
+    session.browser = MagicMock()
+    session.context.close.side_effect = RuntimeError("context boom")
+
+    # Should not raise — failures are swallowed and logged.
+    session.__exit__(None, None, None)
+    session.context.close.assert_called_once()
+    session.browser.close.assert_called_once()   # ← key: ran despite context failure
+    session._pw.stop.assert_called_once()        # ← key: outer finally still ran
+
+
 def test_missing_selector_fails_gracefully(browser_router):
     """Resolver miss must return failed (not crash) so HITL can engage."""
     seq = [

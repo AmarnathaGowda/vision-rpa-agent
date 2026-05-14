@@ -48,13 +48,28 @@ TRANSIENT_MARKERS = (
 
 
 class RecoveryHandler:
-    """Stateless policy — instance kept for future caching of error patterns."""
+    """Stateless policy — instance kept for future caching of error patterns.
 
-    MAX_RDP_RECONNECTS = 3
+    Note: the RDP reconnect limit is owned by ``RDPHandler.MAX_RECONNECTS``
+    (the executor is the authoritative counter). Recovery reads it from the
+    handler when one is provided; otherwise falls back to a safe default so
+    the policy still works in isolation.
+    """
+
+    DEFAULT_MAX_RDP_RECONNECTS = 3
     MAX_TRANSIENT_RETRIES = 3
 
     def __init__(self, rdp: "RDPHandler | None" = None) -> None:
         self.rdp = rdp
+
+    @property
+    def max_rdp_reconnects(self) -> int:
+        # ``getattr`` on a MagicMock returns a child MagicMock (not the default),
+        # so we must verify the attribute is actually an int.
+        candidate = getattr(self.rdp, "MAX_RECONNECTS", None) if self.rdp else None
+        if isinstance(candidate, int):
+            return candidate
+        return self.DEFAULT_MAX_RDP_RECONNECTS
 
     # ── error-from-screen path ──────────────────────────────────────────────
     def detect(self, screen: ScreenState, working: "WorkingMemory") -> RecoveryDirective | None:
@@ -92,7 +107,7 @@ class RecoveryHandler:
             if self.rdp is None or not self.rdp.session:
                 return RecoveryDirective(action="hitl",
                                          reason="rdp_disconnect_no_session")
-            if self.rdp.session.reconnect_count >= self.MAX_RDP_RECONNECTS:
+            if self.rdp.session.reconnect_count >= self.max_rdp_reconnects:
                 return RecoveryDirective(action="hitl",
                                          reason="rdp_reconnect_limit")
             return RecoveryDirective(

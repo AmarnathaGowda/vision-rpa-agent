@@ -149,3 +149,19 @@ def test_wait_for_raises_desktop_error_when_element_never_appears():
     app.top_window.return_value.child_window.return_value = branch
     with pytest.raises(DesktopError, match="not present"):
         de.wait_for(None, "ghost", timeout_s=0.1)
+
+
+def test_attach_short_circuits_on_pywinauto_unavailable():
+    """When pywinauto is unavailable, attach() must raise immediately —
+    not busy-loop for DEFAULT_TIMEOUT_S seconds."""
+    import time as time_mod
+    de = DesktopExecutor()
+    with patch.object(DesktopExecutor, "_pywinauto_application",
+                      staticmethod(lambda: (_ for _ in ()).throw(
+                          DesktopError("pywinauto missing")))):
+        start = time_mod.monotonic()
+        with pytest.raises(DesktopError, match="pywinauto missing"):
+            de.attach(title_re="Anything", timeout_s=10.0)
+        elapsed = time_mod.monotonic() - start
+        # Should be near-instant; allow generous slack for slow CI.
+        assert elapsed < 1.0, f"attach() busy-looped for {elapsed:.2f}s"

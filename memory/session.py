@@ -143,6 +143,43 @@ class SessionMemory:
             return json.loads(row["resolution"]) if row["resolution"] else {}
         return None
 
+    def list_hitl(self, status: str | None = None) -> list[dict]:
+        """Return HITL rows (optionally filtered by status) for the dashboard."""
+        if status is None:
+            rows = self.conn.execute(
+                "SELECT * FROM hitl_queue ORDER BY id DESC"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM hitl_queue WHERE status=? ORDER BY id DESC",
+                (status,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_hitl(self, hitl_id: int) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM hitl_queue WHERE id=?", (hitl_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_hitl(self, hitl_id: int, resolution: dict) -> None:
+        """Mark a HITL row resolved and persist the resolution payload."""
+        self.conn.execute(
+            "UPDATE hitl_queue SET status='resolved', resolution=?, "
+            "resolved_at=CURRENT_TIMESTAMP WHERE id=?",
+            (json.dumps(resolution), hitl_id),
+        )
+        # Move task back to 'running' so the supervisor knows to resume it.
+        row = self.conn.execute(
+            "SELECT task_id FROM hitl_queue WHERE id=?", (hitl_id,)
+        ).fetchone()
+        if row:
+            self.conn.execute(
+                "UPDATE tasks SET status='running' WHERE task_id=?",
+                (row["task_id"],),
+            )
+        self.conn.commit()
+
     # ── task lifecycle ────────────────────────────────────────────────────
     def start_task(self, task_id: str, task_type: str, goal: str,
                    agent_id: str) -> None:

@@ -75,19 +75,21 @@ class FieldSpec:
       ``aliases`` and ``pattern`` are present, the matcher looks for the
       pattern *near* an alias (line-windowed).
     * ``is_financial`` raises the confidence bar for HITL gating.
+    * ``pages`` restricts VLM tier to specific 1-based page numbers. ``None``
+      = scan up to ``settings.vlm_max_pages`` pages from the start of the
+      document, stopping early once the field is found.
     """
     name: str
     aliases: list[str] = field(default_factory=list)
     pattern: str | None = None
     is_financial: bool = False
     min_confidence: float | None = None  # override; defaults to settings.confidence_threshold
+    pages: list[int] | None = None       # 1-based; VLM tier only — tier 1/2 always scan all
 
 
 # ── pipeline ────────────────────────────────────────────────────────────────
 class ExtractionPipeline:
     """Three-tier extractor: pdfplumber → OCR → VLM."""
-
-    OCR_DPI = 300
 
     def __init__(self,
                  vlm_client: Any | None = None,
@@ -189,7 +191,7 @@ class ExtractionPipeline:
         try:
             for i in range(doc.page_count):
                 page = doc.load_page(i)
-                pix = page.get_pixmap(dpi=self.OCR_DPI)
+                pix = page.get_pixmap(dpi=settings.ocr_dpi)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
                 text = pytesseract.image_to_string(img) or ""
                 text_by_page.append((i + 1, text))
@@ -208,51 +210,132 @@ class ExtractionPipeline:
     # ── tier 3: VLM ─────────────────────────────────────────────────────────
     def _tier_vlm(self, path: Path, specs: list[FieldSpec],
                   result: ExtractionResult) -> None:
-        import base64
+        """Iterate pages with a budget. Specs drop out as they're found.
+
+        Each VLM call covers ONE page but batches all still-pending specs into
+        a single prompt — so an N-page PDF with M missing fields costs at most
+        ``min(N, vlm_max_pages)`` VLM calls, not N*M.
+        """
         fitz = self._fitz or self._import_fitz()
         result.tiers_used.append("vlm")
+
         doc = fitz.open(str(path))
         try:
-            # VLMs are token-expensive — only send page 1 unless a spec asks
-            # for "page_2" / "page_3" in its alias hints (rarely needed).
-            page = doc.load_page(0)
-            pix = page.get_pixmap(dpi=200)
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            total_pages = doc.page_count
+            for page_no in self._vlm_page_order(specs, total_pages):
+                pending = self._specs_pending_for_page(specs, page_no, result)
+                if not pending:
+                    continue
+                self._vlm_one_page(doc, page_no, pending, result)
         finally:
             doc.close()
 
+    def _vlm_one_page(self, doc, page_no: int, specs: list[FieldSpec],
+                      result: ExtractionResult) -> None:
+        """Render page ``page_no`` (1-based) and ask the VLM for ``specs``."""
+        import base64
+        import json
+
+        try:
+            page = doc.load_page(page_no - 1)
+            pix = page.get_pixmap(dpi=settings.vlm_dpi)
+            b64 = base64.b64encode(pix.tobytes("png")).decode()
+        except Exception as e:  # noqa: BLE001
+            log.warning("vlm_page_render_failed", page=page_no, error=str(e))
+            return
+
         field_list = ", ".join(s.name for s in specs)
         prompt = _VLM_PROMPT.format(fields=field_list)
-        resp = self.vlm_client.chat.completions.create(
-            model=settings.model_name,
-            messages=[{"role": "user", "content": [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                {"type": "text", "text": prompt},
-            ]}],
-            max_tokens=1024,
-            temperature=0.0,
-        )
-        import json
+        try:
+            resp = self.vlm_client.chat.completions.create(
+                model=settings.model_name,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {"type": "text", "text": prompt},
+                ]}],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("vlm_call_failed", page=page_no, error=str(e))
+            return
+
         raw = strip_json_fence(resp.choices[0].message.content or "")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            log.warning("vlm_extraction_parse_failed", error=str(e), raw=raw[:200])
+            log.warning("vlm_extraction_parse_failed",
+                        page=page_no, error=str(e), raw=raw[:200])
             return
+
         for spec in specs:
             entry = data.get(spec.name) or {}
             val = entry.get("value")
             if val in (None, "", "null"):
                 continue
             conf = float(entry.get("confidence", 0.6))
+            # Don't overwrite a higher-confidence hit from an earlier page.
+            existing = result.fields.get(spec.name)
+            if existing is not None and existing.confidence >= conf:
+                continue
             result.fields[spec.name] = FieldExtraction(
                 value=str(val),
                 confidence=max(0.0, min(1.0, conf)),
                 method="vlm",
-                location_hint=str(entry.get("location_hint", "page 1")),
+                location_hint=str(entry.get("location_hint", f"page {page_no}")),
                 is_financial=spec.is_financial,
             )
+
+    @staticmethod
+    def _vlm_page_order(specs: list[FieldSpec], total_pages: int) -> list[int]:
+        """Build the page-iteration order, respecting per-spec ``pages`` hints
+        and bounded by ``settings.vlm_max_pages``.
+
+        Pages explicitly listed in any spec's ``pages`` come first (deduped,
+        in order of first appearance). Then we fill the rest of the budget
+        with sequential pages 1..N not already chosen.
+        """
+        budget = settings.vlm_max_pages
+        order: list[int] = []
+        seen: set[int] = set()
+
+        # 1. Explicit per-spec hints, in spec order.
+        for spec in specs:
+            for p in (spec.pages or []):
+                if 1 <= p <= total_pages and p not in seen:
+                    order.append(p)
+                    seen.add(p)
+                    if len(order) >= budget:
+                        return order
+
+        # 2. Fill remaining budget with sequential pages.
+        for p in range(1, total_pages + 1):
+            if p in seen:
+                continue
+            order.append(p)
+            seen.add(p)
+            if len(order) >= budget:
+                break
+        return order
+
+    @staticmethod
+    def _specs_pending_for_page(specs: list[FieldSpec], page_no: int,
+                                 result: ExtractionResult) -> list[FieldSpec]:
+        """Filter specs whose value is not yet found AND which target this page
+        (or have no page hint, meaning any page)."""
+        pending = []
+        for spec in specs:
+            current = result.fields.get(spec.name)
+            threshold = (spec.min_confidence
+                         if spec.min_confidence is not None
+                         else settings.confidence_threshold)
+            if current is not None and current.value and current.confidence >= threshold:
+                continue
+            if spec.pages and page_no not in spec.pages:
+                continue
+            pending.append(spec)
+        return pending
 
     # ── helpers ─────────────────────────────────────────────────────────────
     @staticmethod

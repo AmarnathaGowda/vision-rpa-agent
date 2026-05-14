@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     hitl_timeout_minutes: int = 30
     hitl_server_port: int = 8080
 
+    # Extraction
+    vlm_max_pages: int = 5     # VLM tier scans at most this many pages per spec
+    vlm_dpi: int = 200         # render DPI for VLM tier
+    ocr_dpi: int = 300         # render DPI for OCR tier
+
     # Mode flags
     use_simulation: bool = True
     headless: bool = False

@@ -49,7 +49,13 @@ class DesktopExecutor:
     def attach(self, title_re: str | None = None,
                process_id: int | None = None,
                timeout_s: float | None = None) -> WindowRef:
-        """Attach to an existing top-level window by title regex or PID."""
+        """Attach to an existing top-level window by title regex or PID.
+
+        Short-circuits immediately on ``DesktopError`` from the pywinauto
+        import — there's no point retrying that for ``timeout_s`` seconds
+        when the failure is deterministic. Other exceptions (window not
+        found yet, transient OS errors) still get the retry loop.
+        """
         Application = self._pywinauto_application()
         timeout_s = timeout_s or self.DEFAULT_TIMEOUT_S
         deadline = time.monotonic() + timeout_s
@@ -67,6 +73,9 @@ class DesktopExecutor:
                 self._apps[pid] = app
                 log.info("desktop_attach", title_re=title_re, process_id=pid)
                 return WindowRef(title=window.window_text(), handle=window, process_id=pid)
+            except DesktopError:
+                # pywinauto unavailable (non-Windows) — deterministic, do not retry.
+                raise
             except Exception as e:  # noqa: BLE001 — pywinauto raises a zoo of types
                 last_err = e
                 time.sleep(self.POLL_S)

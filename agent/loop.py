@@ -16,6 +16,7 @@ from typing import Any
 from agent.audit import AuditLog
 from agent.perception import PerceptionLayer
 from agent.planner import ActionPlanner
+from agent.recovery import RecoveryDirective, RecoveryHandler
 from agent.schemas import ActionPlan, ActionResult, ScreenState
 from config.logging_config import get_logger
 from config.settings import settings
@@ -66,6 +67,7 @@ class AgentLoop:
         perception: PerceptionLayer | None = None,
         planner: ActionPlanner | None = None,
         executor: Any | None = None,
+        recovery: RecoveryHandler | None = None,
         audit: AuditLog | None = None,
         agent_id: str | None = None,
     ) -> None:
@@ -74,6 +76,7 @@ class AgentLoop:
         self.perception = perception or PerceptionLayer()
         self.planner = planner or ActionPlanner(retry_limit=self.RETRY_LIMIT)
         self.executor = executor or StubExecutor()
+        self.recovery = recovery or RecoveryHandler()
         self.agent_id = agent_id or settings.agent_id
         self.audit = audit or AuditLog(self.agent_id)
         self.working: WorkingMemory | None = None
@@ -102,6 +105,13 @@ class AgentLoop:
 
         while self._should_continue():
             screen = self._observe()
+
+            # Recovery — pre-action: blocking modal / error_present → override plan or HITL
+            pre = self.recovery.detect(screen, self.working)
+            if pre is not None:
+                if self._apply_directive(pre, screen, planning_phase=True):
+                    continue   # directive handled — next loop iteration
+
             plan = self._reason(screen)
 
             if plan.requires_hitl:
@@ -111,9 +121,106 @@ class AgentLoop:
                 continue  # _should_continue() will exit with exit_reason="hitl_pending"
 
             result = self._act(plan)
+
+            # Recovery — post-action: classify failed results, run rdp_reconnect, etc.
+            if result.status == "failed":
+                post = self.recovery.recover(plan, result, self.working)
+                if self._apply_directive(post, screen, planning_phase=False,
+                                          failed_plan=plan, failed_result=result):
+                    continue
+
             self._store(plan, result, screen)
 
         return self._finalise()
+
+    def _apply_directive(self,
+                         directive: RecoveryDirective,
+                         screen: ScreenState,
+                         planning_phase: bool,
+                         failed_plan: ActionPlan | None = None,
+                         failed_result: ActionResult | None = None) -> bool:
+        """Apply a RecoveryDirective. Returns True if the loop should `continue`.
+
+        Recovery is bounded: each step gets at most ``RETRY_LIMIT`` recovery
+        invocations before we hand off to HITL. This protects against
+        runaway recover→fail→recover cycles.
+        """
+        assert self.working is not None
+        step_key = str(self.working.step)
+        rec_counts = self.working.retry_counts
+        rec_attempts = rec_counts.get(f"recovery_{step_key}", 0)
+
+        log.info("recovery_directive",
+                 step=self.working.step,
+                 action=directive.action,
+                 reason=directive.reason,
+                 attempts=rec_attempts,
+                 phase="pre" if planning_phase else "post")
+        self.audit.append("recovery_directive",
+                          task_id=self.working.task_id,
+                          step=self.working.step,
+                          action=directive.action,
+                          reason=directive.reason)
+
+        if directive.action == "hitl":
+            # Synthesise a placeholder plan when the post-action path didn't
+            # produce one (happens only in the pre-action / detect branch).
+            hitl_plan = failed_plan or ActionPlan(
+                action_type="flag_human",
+                target=directive.reason or "recovery_hitl",
+                reason=directive.reason or "recovery escalated",
+                requires_hitl=True,
+                confidence=0.0,
+            )
+            self._route_to_hitl(hitl_plan, screen)
+            self._store(hitl_plan,
+                        ActionResult(status="deferred", error_msg=directive.reason),
+                        screen)
+            return True
+
+        if directive.action == "abort":
+            self.working.exit_reason = directive.reason or "recovery_abort"
+            self.working.hitl_pending = True
+            return True
+
+        if directive.action == "skip":
+            # Advance past the current step without re-attempting it.
+            self.working.step += 1
+            return True
+
+        if directive.action in ("retry", "rdp_reconnect"):
+            rec_counts[f"recovery_{step_key}"] = rec_attempts + 1
+            if rec_attempts + 1 > self.RETRY_LIMIT:
+                log.warning("recovery_attempts_exceeded",
+                            step=self.working.step,
+                            attempts=rec_attempts + 1)
+                self._route_to_hitl(
+                    failed_plan or ActionPlan(
+                        action_type="flag_human", target="recovery_loop_exceeded",
+                        reason=f"recovery '{directive.action}' attempted "
+                               f"{rec_attempts + 1}× on step {self.working.step}",
+                        requires_hitl=True, confidence=0.0,
+                    ),
+                    screen,
+                )
+                self._store(failed_plan or ActionPlan(action_type="noop"),
+                            failed_result or ActionResult(
+                                status="failed",
+                                error_msg=f"recovery_attempts_exceeded ({directive.action})"),
+                            screen)
+                return True
+
+            # Execute the follow-up plan (e.g. close-modal click, rdp_reconnect).
+            if directive.follow_up_plan is not None:
+                followup_result = self._act(directive.follow_up_plan)
+                self._store(directive.follow_up_plan, followup_result, screen)
+                # Don't advance the original step — the next loop iteration
+                # will re-perceive and re-plan.
+            # On a plain "retry" with no follow-up, just consume the loop turn.
+            return True
+
+        log.warning("recovery_unknown_action", action=directive.action)
+        return False
 
     # ── pipeline steps ────────────────────────────────────────────────────
     def _init_task(self, task: dict) -> None:

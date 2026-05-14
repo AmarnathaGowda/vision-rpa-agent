@@ -55,14 +55,29 @@ class BrowserSession:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Guaranteed cleanup — every step runs even if an earlier one raises.
+
+        Nested try/finally so a failure in ``context.close()`` does not
+        prevent ``browser.close()`` from running, and a failure in either
+        does not prevent ``_pw.stop()``.
+        """
         try:
-            if self.context:
-                self.context.close()
-            if self.browser:
-                self.browser.close()
+            try:
+                if self.context:
+                    self.context.close()
+            except Exception as e:  # noqa: BLE001 — log and continue cleanup
+                log.warning("browser_context_close_failed", error=str(e))
+            try:
+                if self.browser:
+                    self.browser.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning("browser_close_failed", error=str(e))
         finally:
-            if self._pw:
-                self._pw.stop()
+            try:
+                if self._pw:
+                    self._pw.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning("browser_playwright_stop_failed", error=str(e))
             log.info("browser_session_closed")
 
 
