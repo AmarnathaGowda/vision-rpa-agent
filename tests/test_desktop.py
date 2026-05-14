@@ -131,3 +131,21 @@ def test_pywinauto_unavailable_returns_failed_result_via_attach():
                           DesktopError("pywinauto missing")))):
         with pytest.raises(DesktopError):
             de.attach(title_re="Whatever")
+
+
+def test_wait_for_succeeds_when_element_appears_immediately():
+    de, app = _executor_with_attached_window()
+    ctrl = MagicMock()
+    app.top_window.return_value.child_window.return_value.wrapper_object.return_value = ctrl
+    # Should not raise — element is found on the first poll.
+    de.wait_for(None, "OK", timeout_s=2.0)
+
+
+def test_wait_for_raises_desktop_error_when_element_never_appears():
+    de, app = _executor_with_attached_window()
+    # Every child_window lookup raises — element never appears.
+    branch = MagicMock()
+    branch.wrapper_object.side_effect = RuntimeError("not there")
+    app.top_window.return_value.child_window.return_value = branch
+    with pytest.raises(DesktopError, match="not present"):
+        de.wait_for(None, "ghost", timeout_s=0.1)

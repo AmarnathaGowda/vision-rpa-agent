@@ -246,5 +246,5 @@ def make_rdp_handler_for_runtime(desktop: "DesktopExecutor",
                                  popen_factory: Callable | None = None) -> RDPHandler:
     """Factory used by run_agent.py — keeps construction in one place."""
     return RDPHandler(desktop=desktop,
-                      keepalive_seconds=getattr(settings, "rdp_keepalive_seconds", None),
+                      keepalive_seconds=settings.rdp_keepalive_seconds,
                       _subprocess=popen_factory)

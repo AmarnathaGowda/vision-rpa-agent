@@ -99,6 +99,17 @@ End-to-end validation on macOS dev box:
 
 ---
 
+## Known Gaps — Phase 3/4 (Carry-Forward)
+
+The following were identified during Phase 3/4 validation and are intentionally deferred:
+
+- [ ] **`RecoveryHandler` not wired into `AgentLoop`** — `agent/recovery.py` is fully implemented and tested in isolation, but `AgentLoop._run_loop()` never calls `recovery.detect(screen, working)` (before reasoning) or `recovery.recover(plan, result, working)` (after a failed action). Blocking modal auto-dismiss, RDP auto-reconnect, and transient-error retry routing are therefore inactive at runtime. Basic HITL escalation still functions via the planner's `_enforce_hitl_rules`. Wire in Phase 5 when the loop gains checkpoint-resume and multi-agent isolation. Tracked in: `agent/recovery.py` + `agent/loop.py._run_loop()`.
+- [ ] **`DesktopExecutor._window` auto-attach may hang on macOS/Linux CI** — `_window()` calls `self.attach()` when the window isn't in `_apps`, which blocks for `DEFAULT_TIMEOUT_S`. This is correct on Windows but can slow down the non-Windows test suite if `title_re` is non-None and no app is pre-seeded. Mitigated by always pre-seeding `_apps` in tests.
+- [ ] **`ExtractionPipeline` VLM tier only sends page 1** — Multi-page PDFs send only the first page to the VLM. The `FieldSpec.aliases` page-hint mechanism is stubbed (comment only). Extend `_tier_vlm` to loop over pages when a spec requests a non-first page.
+- [ ] **Windows runtime validation pending** — RDP/desktop/mstsc paths require a Windows host with `pywinauto`, `mss`, and the App VM accessible. Tracked in `docs/assumptions.md` A-06 / A-08 / A-09 / A-10.
+
+---
+
 ## Queued — Phase 5 (HITL + 3 Agents)
 
 - [ ] `hitl/queue.py`
@@ -106,6 +117,7 @@ End-to-end validation on macOS dev box:
 - [ ] Agent checkpoint resume after HITL
 - [ ] 3-agent parallel test
 - [ ] HITL dashboard multi-agent view
+- [ ] Wire `RecoveryHandler` into `AgentLoop._run_loop()` (see carry-forward above)
 
 ---
 

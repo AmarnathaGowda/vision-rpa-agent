@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     rdp_password: str = ""
     rdweb_username: str = ""
     rdweb_password: str = ""
+    rdp_keepalive_seconds: int = 240
 
     # Agent behaviour
     agent_id: str = "agent_01"

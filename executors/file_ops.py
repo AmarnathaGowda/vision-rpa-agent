@@ -239,6 +239,8 @@ class FileExecutor:
         log.info("excel_write", path=str(path), rows=len(rows))
         return path
 
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(0.5),
+           retry=retry_if_exception_type(OSError), reraise=True)
     def update_excel_cell(self, path: str | Path, sheet: str,
                           row: int, column: int | str, value) -> None:
         """1-based row / column (or column letter). Loads, edits, saves in place."""

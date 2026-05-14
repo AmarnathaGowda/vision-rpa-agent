@@ -138,3 +138,33 @@ def test_execute_routes_rdp_disconnect_when_no_session():
     # No session is fine — disconnect should no-op cleanly.
     result = handler.execute(ActionPlan(action_type="rdp_disconnect"))
     assert result.status == "ok"
+
+
+def test_detect_disconnect_true_when_no_session():
+    handler = RDPHandler(desktop=MagicMock())
+    assert handler.detect_disconnect() is True
+
+
+def test_detect_disconnect_false_when_window_exists(tmp_path):
+    rdp = tmp_path / "x.rdp"; rdp.write_text("x")
+    factory, _ = _fake_popen_factory()
+    handler = RDPHandler(desktop=_fake_desktop_with_window(),
+                         keepalive_seconds=86400, _subprocess=factory)
+    with patch("executors.rdp.sys") as sysmod:
+        sysmod.platform = "win32"
+        handler.launch(rdp, connect_timeout_s=2)
+    # window.handle.exists() is True in the fake — so detect_disconnect returns False.
+    assert handler.detect_disconnect() is False
+
+
+def test_detect_disconnect_true_when_window_vanishes(tmp_path):
+    rdp = tmp_path / "x.rdp"; rdp.write_text("x")
+    factory, _ = _fake_popen_factory()
+    handler = RDPHandler(desktop=_fake_desktop_with_window(),
+                         keepalive_seconds=86400, _subprocess=factory)
+    with patch("executors.rdp.sys") as sysmod:
+        sysmod.platform = "win32"
+        handler.launch(rdp, connect_timeout_s=2)
+    # Simulate the window disappearing after connection.
+    handler.session.window.handle.exists.return_value = False
+    assert handler.detect_disconnect() is True
