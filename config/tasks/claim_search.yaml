@@ -1,0 +1,27 @@
+# Claim search + read amount + status — exercises read/extract path.
+task_id: ld_claim_search
+task_type: case2
+app: browser
+goal: "Search for a claim and capture its status and amount."
+
+steps:
+  - action_type: navigate
+    target: "{{LD_BASE_URL}}/claim_search.html"
+    reason: "open claim search page"
+  - action_type: type
+    target: claim_id
+    value: "CLM-12345"
+    reason: "enter the claim id"
+  - action_type: click
+    target: search
+    reason: "trigger search"
+  - action_type: wait
+    target: result_row
+    reason: "wait for results"
+  - action_type: read
+    target: result_status
+    reason: "capture status"
+  - action_type: extract
+    target: result_amount
+    is_financial: true
+    reason: "capture amount — flagged financial"

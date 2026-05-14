@@ -1,0 +1,27 @@
+# LD-shaped login flow.
+# Set LD_BASE_URL in .env to point at a sim server, or override --url
+# at runtime. The deterministic `steps:` block bypasses the VLM so this
+# task is reproducible in CI.
+task_id: ld_login
+task_type: case1
+app: browser
+goal: "Log into RD Web Access with stored credentials."
+
+steps:
+  - action_type: navigate
+    target: "{{LD_BASE_URL}}/login.html"
+    reason: "open the login page"
+  - action_type: type
+    target: username
+    value: "automation_user"
+    reason: "fill username"
+  - action_type: type
+    target: password
+    value: "REPLACE_AT_RUNTIME"
+    reason: "fill password"
+  - action_type: click
+    target: sign_in
+    reason: "submit credentials"
+  - action_type: wait
+    target: page_title
+    reason: "wait for landing page"

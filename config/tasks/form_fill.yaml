@@ -1,0 +1,28 @@
+# IIM-shaped form fill + submit + success-toast verification.
+task_id: iim_form_fill
+task_type: case3
+app: browser
+goal: "Fill the IIM loan form and verify the success toast appears."
+
+steps:
+  - action_type: navigate
+    target: "{{IIM_BASE_URL}}/form.html"
+    reason: "open the form"
+  - action_type: type
+    target: loan_number
+    value: "0156312522"
+    reason: "fill loan number"
+  - action_type: type
+    target: amount
+    value: "10640.58"
+    is_financial: true
+    reason: "fill amount — flagged financial"
+  - action_type: click
+    target: submit
+    reason: "submit form"
+  - action_type: wait
+    target: success_toast
+    reason: "verify success toast"
+  - action_type: read
+    target: success_toast
+    reason: "capture the confirmation message"

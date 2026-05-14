@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LD Simulation — Login</title>
+  <style>body{font-family:sans-serif;max-width:480px;margin:60px auto}label{display:block;margin-top:12px}input{width:100%;padding:8px}button{margin-top:16px;padding:8px 16px}</style>
+</head>
+<body>
+  <h1 data-testid="page-title">RD Web Access — Sign In</h1>
+  <form id="login-form">
+    <label for="username">Username</label>
+    <input data-testid="user-input" id="username" name="username" type="text" aria-label="Username">
+
+    <label for="password">Password</label>
+    <input data-testid="password-input" id="password" name="password" type="password" aria-label="Password">
+
+    <button data-testid="submit-btn" id="submit" type="button" aria-label="Sign in"
+            onclick="document.location='claim_search.html?u='+encodeURIComponent(document.getElementById('username').value)">Sign in</button>
+  </form>
+</body>
+</html>

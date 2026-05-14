@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LD Simulation — Claim Search</title>
+  <style>body{font-family:sans-serif;max-width:720px;margin:40px auto}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{border:1px solid #ccc;padding:6px 10px}</style>
+</head>
+<body>
+  <h1 data-testid="page-title">Claim Search</h1>
+  <label for="claim_id">Claim ID</label>
+  <input data-testid="claim-input" id="claim_id" name="claim_id" type="text" aria-label="Claim ID">
+
+  <button data-testid="search-btn" id="search" type="button" aria-label="Search"
+          onclick="
+            var v = document.getElementById('claim_id').value;
+            document.getElementById('result').style.display='block';
+            document.getElementById('result-claim').textContent = v || 'CLM-UNKNOWN';
+          ">Search</button>
+
+  <div id="result" data-testid="result-row" style="display:none">
+    <h2>Match</h2>
+    <table>
+      <tr><th>Claim ID</th><td data-testid="result-claim" id="result-claim"></td></tr>
+      <tr><th>Status</th><td data-testid="result-status">In Review</td></tr>
+      <tr><th>Amount</th><td data-testid="result-amount">$10,640.58</td></tr>
+    </table>
+  </div>
+</body>
+</html>

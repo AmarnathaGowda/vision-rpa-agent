@@ -8,9 +8,18 @@ from pydantic import BaseModel, Field, field_validator
 AppType = Literal["browser", "desktop", "rdp", "file_explorer", "dialog", "unknown"]
 TaskProgress = Literal["not_started", "in_progress", "blocked", "complete"]
 ActionType = Literal[
+    # Browser + generic
     "click", "type", "navigate", "read", "extract", "wait",
     "flag_human", "js_eval", "noop",
+    # Desktop / dropdown
+    "select_option",
+    # File Explorer / shared folder
+    "file_navigate", "file_open",
+    # RDP lifecycle
+    "rdp_launch", "rdp_disconnect", "rdp_reconnect",
 ]
+
+ExecutorScope = Literal["browser", "desktop", "rdp", "file", "auto"]
 
 
 class VisibleElement(BaseModel):
@@ -48,6 +57,10 @@ class ActionPlan(BaseModel):
     is_financial: bool = False
     requires_hitl: bool = False
     cache_hit: bool = False
+    # When "auto" (default), the ActionRouter infers the executor from
+    # action_type. Set explicitly to override (e.g. when "click" should hit a
+    # desktop app instead of the browser).
+    app: ExecutorScope = "auto"
 
     @field_validator("confidence")
     @classmethod

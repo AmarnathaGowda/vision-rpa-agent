@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -25,12 +27,54 @@ def preflight_checks() -> None:
         sys.exit(1)
 
 
+_TEMPLATE_RE = re.compile(r"\{\{\s*([A-Z_][A-Z0-9_]*)\s*\}\}")
+
+
+def _expand(value, env: dict[str, str]):
+    """Recursively substitute {{VAR}} occurrences in strings."""
+    if isinstance(value, str):
+        return _TEMPLATE_RE.sub(lambda m: env.get(m.group(1), m.group(0)), value)
+    if isinstance(value, list):
+        return [_expand(v, env) for v in value]
+    if isinstance(value, dict):
+        return {k: _expand(v, env) for k, v in value.items()}
+    return value
+
+
 def load_task(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
         raise ValueError(f"Task YAML must be a mapping, got {type(data).__name__}: {path}")
-    return data
+
+    # Substitute {{LD_BASE_URL}} / {{IIM_BASE_URL}} etc. from settings + env.
+    from config.settings import settings
+    env = {
+        "LD_BASE_URL": settings.ld_base_url,
+        "IIM_BASE_URL": settings.iim_base_url,
+        "RDWEB_URL":   settings.rdweb_url,
+        **{k: v for k, v in os.environ.items() if k.isupper()},
+    }
+    return _expand(data, env)
+
+
+def _build_router(task: dict, agent_id: str):
+    """Return (router_or_executor, cleanup_callable). Browser apps get a real session."""
+    from agent.router import ActionRouter
+    from executors.browser import BrowserExecutor, BrowserSession
+    from executors.selectors import SelectorResolver
+    from config.locators import rdweb
+
+    app = task.get("app", "browser")
+    if app == "browser":
+        session = BrowserSession().__enter__()
+        resolver = SelectorResolver(locator_map=rdweb.ALL)
+        executor = BrowserExecutor(session.page, resolver=resolver)
+        router = ActionRouter(browser=executor)
+        return router, (lambda: session.__exit__(None, None, None))
+    # Phase 3+ executors will land here. For now: stub fallback.
+    from agent.loop import StubExecutor
+    return StubExecutor(), (lambda: None)
 
 
 def main() -> int:
@@ -80,15 +124,21 @@ def main() -> int:
                  message="skeleton imports cleanly; loop not invoked for smoke task")
         return 0
 
-    if not args.skip_preflight:
+    # Deterministic tasks skip the VLM entirely; preflight only matters for VLM mode.
+    if not args.skip_preflight and not task.get("steps"):
         preflight_checks()
 
     from agent.loop import AgentLoop
     from memory.session import SessionMemory
 
     session = SessionMemory(agent_id=agent_id)
-    loop = AgentLoop(session=session, agent_id=agent_id)
-    result = loop.run(task)
+    executor, cleanup = _build_router(task, agent_id)
+    try:
+        loop = AgentLoop(session=session, executor=executor, agent_id=agent_id)
+        result = loop.run(task)
+    finally:
+        cleanup()
+
     log.info("agent_complete", **result)
     return 0 if result["status"] != "failed" else 2
 

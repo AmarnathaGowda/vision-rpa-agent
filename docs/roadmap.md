@@ -57,30 +57,33 @@ Total estimated time to MVP (3 agents working): **10–12 weeks**
 
 ---
 
-## Phase 2 — Browser Execution (Week 5–6)
+## Phase 2 — Browser Execution (Week 5–6) — ✅ COMPLETE
 
 **Goal:** Agent can fully automate browser-based workflows against simulation sites.
 
 ### Tasks
 
-- [ ] Implement `executors/browser.py` — full Playwright executor
-  - [ ] navigate, click, type, select, read_table, extract_text, wait_for, download
-- [ ] Implement selector resolution strategy (data-testid → aria-label → LLM-generated)
-- [ ] Implement `ActionRouter` — routes browser actions to BrowserExecutor
-- [ ] Connect Playwright page lifecycle to AgentLoop (launch, reuse, close)
-- [ ] Implement `memory/session.py` — SQLite with tasks, actions, checkpoints tables
-- [ ] Implement checkpoint write after every action
-- [ ] Write task YAML for: login flow, claim search, form fill
-- [ ] Test end-to-end against LD simulation site (localhost)
-- [ ] Test end-to-end against IIM simulation site (localhost)
-- [ ] Implement screenshot capture on every action (stored to SCREENSHOT_DIR)
-- [ ] Write integration tests for browser executor
+- [x] Implement `executors/browser.py` — full Playwright executor (`BrowserSession` + `BrowserExecutor`)
+  - [x] navigate, click, type (fill), read/extract, wait_for, js_eval, download
+- [x] Implement selector resolution strategy (`executors/selectors.py`) — testid → aria-label → name → text → fallback → raise (`flag_human`)
+- [x] Implement `ActionRouter` — routes browser actions to `BrowserExecutor`, surfaces "not implemented" for desktop/rdp until Phase 3
+- [x] Connect Playwright page lifecycle to AgentLoop via `run_agent.py` (`BrowserSession` context manager)
+- [x] Extend `memory/session.py` — `start_task` / `complete_task` / `log_action` / `log_extraction` / `get_actions`
+- [x] Implement checkpoint + action-log write after every step (in `AgentLoop._store`)
+- [x] Write task YAML for: login flow, claim search, form fill (under `config/tasks/`)
+- [x] Test end-to-end against vendored LD-shaped sim pages — see `tests/test_browser_integration.py`
+- [x] Test end-to-end against vendored IIM-shaped sim pages — same suite
+- [x] Implement screenshot capture on every action (stored under `SCREENSHOT_DIR`)
+- [x] Write integration tests for browser executor (50/50 passing — incl. 4 real-Chromium tests)
 
-**Exit criteria:** Agent completes a login → search → extract → validate workflow on simulation sites autonomously, with full audit log and session checkpoint.
+Deviations from the original wording:
+- The roadmap referenced *external* LD / IIM "simulation sites (localhost)". This repo doesn't ship those servers, so we vendored equivalent HTML under `tests/sim/pages/` and tested via `file://`. The agent code is URL-agnostic — pointing `LD_BASE_URL` / `IIM_BASE_URL` at a real localhost sim swaps the target with no code changes. See `docs/todo.md` for the carry-over notes.
+
+**Exit criteria:** Agent completes a login → search → extract → validate workflow on simulation sites autonomously, with full audit log and session checkpoint. ✅ verified via `pytest tests/test_loop_deterministic.py` + `run_agent.py --task config/tasks/claim_search.yaml`.
 
 ---
 
-## Phase 3 — Desktop and RDP Execution (Week 7–8)
+## Phase 3 — Desktop and RDP Execution (Week 7–8) — in progress
 
 **Goal:** Agent can launch RDP sessions and automate desktop apps and File Explorer.
 

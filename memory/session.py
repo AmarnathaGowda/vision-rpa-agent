@@ -142,3 +142,62 @@ class SessionMemory:
         if row and row["status"] == "resolved":
             return json.loads(row["resolution"]) if row["resolution"] else {}
         return None
+
+    # ── task lifecycle ────────────────────────────────────────────────────
+    def start_task(self, task_id: str, task_type: str, goal: str,
+                   agent_id: str) -> None:
+        """Idempotent — INSERT OR REPLACE so resume() works."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks "
+            "(task_id, task_type, goal, status, agent_id) "
+            "VALUES (?,?,?, 'running', ?)",
+            (task_id, task_type, goal, agent_id),
+        )
+        self.conn.commit()
+
+    def complete_task(self, task_id: str, status: str, result: dict | None = None) -> None:
+        self.conn.execute(
+            "UPDATE tasks SET status=?, completed_at=CURRENT_TIMESTAMP, "
+            "result_json=? WHERE task_id=?",
+            (status, json.dumps(result or {}), task_id),
+        )
+        self.conn.commit()
+
+    # ── action log ────────────────────────────────────────────────────────
+    def log_action(self, task_id: str, step: int, plan, result,
+                   screenshot: str = "") -> int:
+        """Append one row to actions table. plan/result are pydantic models."""
+        cur = self.conn.execute(
+            "INSERT INTO actions "
+            "(task_id, step, action_type, target, value, result_status, error_msg, "
+            " duration_ms, screenshot) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                task_id, step,
+                plan.action_type, plan.target, plan.value,
+                result.status, result.error_msg, result.duration_ms,
+                screenshot or result.screenshot_path,
+            ),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_actions(self, task_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM actions WHERE task_id=? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── extraction log ────────────────────────────────────────────────────
+    def log_extraction(self, task_id: str, field_name: str, raw_value: str,
+                       normalized: str, confidence: float, method: str,
+                       source_doc: str = "", is_financial: bool = False) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO extractions "
+            "(task_id, field_name, raw_value, normalized, confidence, method, "
+            " source_doc, is_financial) VALUES (?,?,?,?,?,?,?,?)",
+            (task_id, field_name, raw_value, normalized, confidence, method,
+             source_doc, 1 if is_financial else 0),
+        )
+        self.conn.commit()
+        return cur.lastrowid

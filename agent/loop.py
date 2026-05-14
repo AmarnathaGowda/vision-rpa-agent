@@ -31,6 +31,15 @@ class TaskGoal:
     task_type: str
     goal: str
     raw: dict
+    steps: list[dict] | None = None   # deterministic step list (optional)
+
+    def deterministic(self) -> bool:
+        return bool(self.steps)
+
+    def step_plan(self, index: int) -> dict | None:
+        if not self.steps or index >= len(self.steps):
+            return None
+        return self.steps[index]
 
 
 class StubExecutor:
@@ -111,15 +120,21 @@ class AgentLoop:
         task_id = task.get("task_id") or f"task_{int(time.time())}"
         task_type = task.get("task_type", "unknown")
         goal = task.get("goal", "")
-        self.task_goal = TaskGoal(task_id=task_id, task_type=task_type, goal=goal, raw=task)
+        steps = task.get("steps")
+        self.task_goal = TaskGoal(task_id=task_id, task_type=task_type, goal=goal,
+                                  raw=task, steps=steps)
         self.working = WorkingMemory(
             task_id=task_id,
             task_type=task_type,
             goal=goal,
             agent_id=self.agent_id,
         )
-        log.info("task_init", task_id=task_id, task_type=task_type, goal=goal)
-        self.audit.append("task_init", task_id=task_id, task_type=task_type, goal=goal)
+        self.session.start_task(task_id=task_id, task_type=task_type, goal=goal,
+                                agent_id=self.agent_id)
+        log.info("task_init", task_id=task_id, task_type=task_type, goal=goal,
+                 deterministic=self.task_goal.deterministic())
+        self.audit.append("task_init", task_id=task_id, task_type=task_type, goal=goal,
+                          deterministic=self.task_goal.deterministic())
 
     def _should_continue(self) -> bool:
         assert self.working is not None
@@ -137,6 +152,22 @@ class AgentLoop:
 
     def _observe(self) -> ScreenState:
         assert self.working is not None and self.task_goal is not None
+        # Deterministic mode: skip VLM perception entirely — the YAML drives steps.
+        if self.task_goal.deterministic():
+            state = ScreenState(
+                app_type="browser",
+                state_summary="deterministic step list",
+                confidence=1.0,
+            )
+            log.info("perception_skipped",
+                     step=self.working.step,
+                     reason="deterministic_task")
+            self.audit.append("perception",
+                              task_id=self.working.task_id,
+                              step=self.working.step,
+                              screen=state.model_dump(),
+                              deterministic=True)
+            return state
         img = self.perception.capture()
         img = self.perception.preprocess(img)
         state = self.perception.understand(img, context={
@@ -157,6 +188,20 @@ class AgentLoop:
 
     def _reason(self, screen: ScreenState) -> ActionPlan:
         assert self.working is not None and self.task_goal is not None
+        step_rule = self.task_goal.step_plan(self.working.step)
+        if step_rule is not None:
+            plan = ActionPlan(cache_hit=True, confidence=1.0, **step_rule)
+            log.info("plan",
+                     step=self.working.step,
+                     action_type=plan.action_type,
+                     target=plan.target,
+                     source="deterministic")
+            self.audit.append("plan",
+                              task_id=self.working.task_id,
+                              step=self.working.step,
+                              plan=plan.model_dump(),
+                              source="deterministic")
+            return plan
         plan = self.planner.decide(
             screen_state=screen,
             working=self.working.to_json(),
@@ -205,13 +250,26 @@ class AgentLoop:
         else:
             self.working.step += 1
 
+        # Deterministic exhaustion → mark task complete.
+        assert self.task_goal is not None
+        if self.task_goal.deterministic() and self.task_goal.step_plan(self.working.step) is None:
+            self.working.task_complete = True
+
         self.session.write_checkpoint(self.working.task_id, step, self.working)
+        self.session.log_action(
+            task_id=self.working.task_id,
+            step=step,
+            plan=plan,
+            result=result,
+            screenshot=result.screenshot_path,
+        )
         self.audit.append("action_result",
                           task_id=self.working.task_id,
                           step=step,
                           status=result.status,
                           duration_ms=result.duration_ms,
-                          error=result.error_msg)
+                          error=result.error_msg,
+                          screenshot=result.screenshot_path)
 
     def _route_to_hitl(self, plan: ActionPlan, screen: ScreenState) -> None:
         assert self.working is not None
@@ -243,6 +301,11 @@ class AgentLoop:
         assert self.working is not None
         reason = self.working.exit_reason or "unknown"
         status = "success" if reason == "task_complete" else "incomplete"
+        self.session.complete_task(
+            self.working.task_id,
+            status=status,
+            result={"exit_reason": reason, "steps": self.working.step},
+        )
         log.info("task_finalise",
                  task_id=self.working.task_id,
                  status=status,

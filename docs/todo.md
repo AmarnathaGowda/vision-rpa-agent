@@ -1,6 +1,6 @@
 # Todo List
 
-Current phase: **Phase 2 — Browser Execution (next)**
+Current phase: **Phase 3 — Desktop + RDP**
 
 Last updated: 2026-05-13
 
@@ -45,29 +45,40 @@ Notes / assumptions:
 
 ---
 
-## Queued — Phase 2 (Browser)
+## Completed — Phase 2 (Browser)
 
-- [ ] `executors/browser.py` full Playwright implementation
-- [ ] Selector resolution strategy
-- [ ] `ActionRouter` browser routing
-- [ ] `memory/session.py` SQLite implementation
-- [ ] Checkpoint write after every action
-- [ ] Task YAMLs: login, claim search, form fill
-- [ ] Integration test against LD simulation
-- [ ] Integration test against IIM simulation
+- [x] `executors/browser.py` full Playwright implementation (`BrowserSession` + `BrowserExecutor`)
+- [x] Selector resolution strategy (`executors/selectors.py`) — testid → aria → name → text → fallback
+- [x] `ActionRouter` browser routing (`agent/router.py`)
+- [x] `memory/session.py` extended (start/complete/log_action/log_extraction/get_actions)
+- [x] Checkpoint + action-log write after every step
+- [x] Task YAMLs: `login.yaml`, `claim_search.yaml`, `form_fill.yaml`
+- [x] Deterministic step-list task mode (runs YAML without the LLM — used for CI)
+- [x] Starter `config/locators/rdweb.py` (LOGIN + CLAIM_SEARCH + FORM + ALL aggregate)
+- [x] Vendored sim HTML pages under `tests/sim/pages/` (login / claim_search / form)
+- [x] Integration tests against the vendored sim — real Chromium, both LD-shaped and IIM-shaped flows
+- [x] Full-loop deterministic e2e run via `run_agent.py` (`config/tasks/claim_search.yaml` returns `status=success`)
+
+Notes / blockers carried forward:
+- The full 120+ POC locator map lands when `insurance-agent-project` is available; current `rdweb.py` is a starter for the vendored sim only.
+- "LD simulation" / "IIM simulation" external servers from the roadmap don't exist in this repo; vendored sim pages cover the same shape and unblock Phase 2 acceptance.
+- Real-application URLs (production LD/IIM) still need confirmation — flagged in "Decisions Needed".
 
 ---
 
-## Queued — Phase 3 (Desktop + RDP)
+## Active — Phase 3 (Desktop + RDP)
 
 - [ ] `executors/rdp.py` — mstsc launch + RemoteApp detection
 - [ ] RDP keep-alive thread
 - [ ] Disconnect detection + reconnect
 - [ ] `executors/desktop.py` — pywinauto UIA
-- [ ] File Explorer automation
-- [ ] ActionRouter desktop routing
-- [ ] RDP perception (window region capture)
-- [ ] Recovery for RDP-specific failures
+- [ ] `executors/file_ops.py` — File Explorer automation
+- [ ] ActionRouter desktop / rdp routing
+- [ ] Extend ActionPlan schema with desktop/rdp action types
+- [ ] `agent/perception.py` — RDP window region capture (bbox-targeted mss grab)
+- [ ] `agent/recovery.py` — RDP-specific recovery (session expired, reconnect, focus loss)
+- [ ] Task YAML for browser→RDP handoff (`config/tasks/rdp_launch.yaml`)
+- [ ] Mock-based unit tests for desktop/rdp/file_ops (Windows-only at runtime — see `docs/assumptions.md`)
 
 ---
 
