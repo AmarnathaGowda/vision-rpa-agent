@@ -1,6 +1,6 @@
 # Todo List
 
-Current phase: **Phase 6 — Hardening** (Phase 5 complete)
+Current phase: **MVP complete** — Phases 0-6 done; only demo recording remains.
 
 Last updated: 2026-05-14
 
@@ -136,14 +136,21 @@ Result: **158 tests collected (151 passed, 7 skipped)** — +20 from this phase.
 
 ---
 
-## Queued — Phase 6 (Hardening)
+## Completed — Phase 6 (Hardening)
 
-- [ ] Full end-to-end test
-- [ ] Error injection tests
-- [ ] Performance tuning
-- [ ] `docs/runbook.md`
-- [ ] `docs/demo-script.md`
-- [ ] Demo recording
+- [x] Full end-to-end test — [tests/test_e2e_full.py](../tests/test_e2e_full.py): happy path, transient-failure-recovers-via-retry-counter, HITL-pause-and-resume, per-step checkpoint persistence
+- [x] Error injection tests — [tests/test_error_injection.py](../tests/test_error_injection.py): executor exception → HITL, financial-below-threshold gate, concurrent SQLite writers, recovery attempts bounded, malformed HITL resolution rejection
+- [x] Performance tuning — [tests/test_performance.py](../tests/test_performance.py): per-step overhead budget (40 steps < 5 s), checkpoint volume linear, 100× SessionMemory open/close < 2 s. Latest dev-box numbers in test output.
+- [x] [`docs/runbook.md`](runbook.md) — daily start-up, multi-agent launching, env switching, healthchecks, common incidents, backup/retention, deploy checklist
+- [x] [`docs/demo-script.md`](demo-script.md) — 12-minute four-act demo (non-negotiables → live happy path → 3-agent parallel → recovery)
+- [ ] Demo recording — out-of-scope for codebase (capture from the script above)
+
+Phase 6 defect closures:
+- `HITLQueue.apply_resolution` now validates the action *before* mutating `WorkingMemory` — a malformed payload leaves `hitl_pending=True` so the supervisor can re-poll instead of silently swallowing the review.
+- `HITLQueue.wait_for_resolution` yields the GIL when callers pass `poll_interval_s=0` so peer threads (resolver, dashboard) make progress under a hot poll.
+- HITLRunner test harnesses replaced fixed-iteration resolver loops with deadline-based ones — eliminates the 200-µs race that caused intermittent test_hitl_pause_and_resume failures.
+
+Result: **170 tests collected (163 passed, 7 skipped)** — +12 from Phase 5. Live `claim_search.yaml --skip-preflight` regression still green.
 
 ---
 

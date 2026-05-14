@@ -89,6 +89,10 @@ class HITLQueue:
         budget_min = timeout_minutes if timeout_minutes is not None else self.timeout_minutes
         budget_s = budget_min * 60
         deadline = time.monotonic() + budget_s
+        # Even when callers inject a no-op ``sleep`` (e.g. tests with
+        # poll_interval_s=0), we yield the GIL once per iteration so
+        # peer threads — like the dashboard or a resolver task — can run.
+        yield_call = (lambda: time.sleep(0)) if self.poll_interval_s == 0 else None
         while True:
             resolution = self.session.poll_hitl(task_id)
             if resolution is not None:
@@ -97,8 +101,10 @@ class HITLQueue:
             if time.monotonic() >= deadline:
                 raise HITLTimeoutError(
                     f"HITL review for task {task_id} timed out after "
-                    f"{timeout_minutes or self.timeout_minutes} minutes"
+                    f"{budget_min} minutes"
                 )
+            if yield_call is not None:
+                yield_call()
             sleep(self.poll_interval_s)
 
     # ── apply ─────────────────────────────────────────────────────────────
@@ -119,6 +125,12 @@ class HITLQueue:
         resolution in ``decisions_log`` for the audit trail.
         """
         action = (resolution.get("action") or "").lower()
+        if action not in ("approve", "correct", "skip", "abort"):
+            # Validate BEFORE mutating working memory — otherwise a malformed
+            # resolution would clear hitl_pending and silently swallow the
+            # review. The runner can then re-poll for a fresh resolution.
+            raise ValueError(f"unknown HITL resolution action: {action!r}")
+
         note = resolution.get("note", "")
         resolver = resolution.get("resolver", "unknown")
 
@@ -164,4 +176,5 @@ class HITLQueue:
                         task_id=working.task_id, step=working.step, note=note)
             return
 
-        raise ValueError(f"unknown HITL resolution action: {action!r}")
+        # Unreachable — validated above.
+        raise AssertionError(f"unhandled validated action: {action!r}")

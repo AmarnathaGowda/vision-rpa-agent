@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time as _time
 
 from agent.loop import AgentLoop
 from agent.schemas import ActionResult
@@ -66,13 +67,13 @@ def test_runner_pauses_then_resumes_after_human_skip(session_store):
 
     # Resolver thread: as soon as the runner has flagged HITL, resolve it.
     def resolver() -> None:
-        for _ in range(200):
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
             rows = session_store.list_hitl(status="pending")
             if rows:
-                # Skip the broken step; subsequent step will also fail but
-                # we'll skip that one too.
                 session_store.resolve_hitl(rows[0]["id"], {"action": "skip"})
                 return
+            _time.sleep(0.01)
 
     t = threading.Thread(target=resolver, daemon=True)
     t.start()
@@ -104,11 +105,13 @@ def test_runner_aborts_when_human_says_abort(session_store):
     runner = HITLRunner(loop=loop, queue=queue, sleep=lambda s: None)
 
     def resolver() -> None:
-        for _ in range(200):
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline:
             rows = session_store.list_hitl(status="pending")
             if rows:
                 session_store.resolve_hitl(rows[0]["id"], {"action": "abort"})
                 return
+            _time.sleep(0.01)
 
     t = threading.Thread(target=resolver, daemon=True)
     t.start()
