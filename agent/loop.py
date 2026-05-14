@@ -247,6 +247,17 @@ class AgentLoop:
         if result.status == "failed":
             key = str(step)
             self.working.retry_counts[key] = self.working.retry_counts.get(key, 0) + 1
+            # Deterministic mode has no planner-side retry guard — enforce one here
+            # so a flaky/missing selector can't loop forever. Routes to HITL after
+            # RETRY_LIMIT attempts at the same step.
+            if self.working.retry_counts[key] >= self.RETRY_LIMIT:
+                log.warning("retry_limit_exceeded", step=step,
+                            attempts=self.working.retry_counts[key],
+                            last_error=result.error_msg)
+                self.audit.append("retry_limit_exceeded",
+                                  task_id=self.working.task_id, step=step,
+                                  attempts=self.working.retry_counts[key])
+                self._route_to_hitl(plan, screen)
         else:
             self.working.step += 1
 

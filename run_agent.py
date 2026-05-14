@@ -58,23 +58,77 @@ def load_task(path: Path) -> dict:
     return _expand(data, env)
 
 
+def _scopes_for_task(task: dict) -> set[str]:
+    """Determine which executors a task needs based on its `app` and step list."""
+    from agent.router import ROUTING_TABLE
+
+    scopes: set[str] = set()
+    declared = task.get("app")
+    if declared and declared != "auto":
+        scopes.add(declared)
+    for step in task.get("steps") or []:
+        s = step.get("app")
+        if s and s != "auto":
+            scopes.add(s)
+        else:
+            scopes.add(ROUTING_TABLE.get(step.get("action_type", ""), "unknown"))
+    # `unknown` means LLM-driven planning may pick anything → assume browser.
+    if not scopes or scopes == {"unknown"}:
+        scopes = {"browser"}
+    scopes.discard("noop")
+    scopes.discard("unknown")
+    return scopes
+
+
 def _build_router(task: dict, agent_id: str):
-    """Return (router_or_executor, cleanup_callable). Browser apps get a real session."""
+    """Return (router, cleanup_callable). Constructs only the executors the task needs."""
     from agent.router import ActionRouter
-    from executors.browser import BrowserExecutor, BrowserSession
-    from executors.selectors import SelectorResolver
     from config.locators import rdweb
 
-    app = task.get("app", "browser")
-    if app == "browser":
-        session = BrowserSession().__enter__()
-        resolver = SelectorResolver(locator_map=rdweb.ALL)
-        executor = BrowserExecutor(session.page, resolver=resolver)
-        router = ActionRouter(browser=executor)
-        return router, (lambda: session.__exit__(None, None, None))
-    # Phase 3+ executors will land here. For now: stub fallback.
-    from agent.loop import StubExecutor
-    return StubExecutor(), (lambda: None)
+    scopes = _scopes_for_task(task)
+    cleanups: list = []
+
+    browser_executor = None
+    if "browser" in scopes:
+        from executors.browser import BrowserExecutor, BrowserSession
+        from executors.selectors import SelectorResolver
+        bs = BrowserSession().__enter__()
+        cleanups.append(lambda: bs.__exit__(None, None, None))
+        browser_executor = BrowserExecutor(
+            bs.page, resolver=SelectorResolver(locator_map=rdweb.ALL)
+        )
+
+    desktop_executor = None
+    if scopes & {"desktop", "rdp", "file"}:
+        from executors.desktop import DesktopExecutor
+        desktop_executor = DesktopExecutor()
+
+    rdp_handler = None
+    if "rdp" in scopes:
+        from executors.rdp import make_rdp_handler_for_runtime
+        rdp_handler = make_rdp_handler_for_runtime(desktop_executor)
+        cleanups.append(rdp_handler.disconnect)
+
+    file_executor = None
+    if "file" in scopes:
+        from executors.file_ops import FileExecutor
+        file_executor = FileExecutor(desktop=desktop_executor)
+
+    router = ActionRouter(
+        browser=browser_executor,
+        desktop=desktop_executor,
+        rdp=rdp_handler,
+        file=file_executor,
+    )
+
+    def cleanup():
+        for fn in reversed(cleanups):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return router, cleanup
 
 
 def main() -> int:

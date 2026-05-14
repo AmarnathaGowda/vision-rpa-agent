@@ -1,6 +1,6 @@
 # Todo List
 
-Current phase: **Phase 3 — Desktop + RDP**
+Current phase: **Phase 4 — Extraction + Memory (next)**
 
 Last updated: 2026-05-13
 
@@ -66,19 +66,25 @@ Notes / blockers carried forward:
 
 ---
 
-## Active — Phase 3 (Desktop + RDP)
+## Completed — Phase 3 (Desktop + RDP)
 
-- [ ] `executors/rdp.py` — mstsc launch + RemoteApp detection
-- [ ] RDP keep-alive thread
-- [ ] Disconnect detection + reconnect
-- [ ] `executors/desktop.py` — pywinauto UIA
-- [ ] `executors/file_ops.py` — File Explorer automation
-- [ ] ActionRouter desktop / rdp routing
-- [ ] Extend ActionPlan schema with desktop/rdp action types
-- [ ] `agent/perception.py` — RDP window region capture (bbox-targeted mss grab)
-- [ ] `agent/recovery.py` — RDP-specific recovery (session expired, reconnect, focus loss)
-- [ ] Task YAML for browser→RDP handoff (`config/tasks/rdp_launch.yaml`)
-- [ ] Mock-based unit tests for desktop/rdp/file_ops (Windows-only at runtime — see `docs/assumptions.md`)
+- [x] `executors/rdp.py` — mstsc launch via `subprocess.Popen`, RemoteApp window detection via `DesktopExecutor.attach()`
+- [x] RDP keep-alive thread (daemon, mouse-nudge every `keepalive_seconds`)
+- [x] Disconnect detection (`detect_disconnect`) + reconnect with attempt counter and `MAX_RECONNECTS=3`
+- [x] `executors/desktop.py` — `DesktopExecutor` with `attach / click / type_text / select_option / read_text / wait_for`, pywinauto-UIA backend, lazy import (loads cleanly on macOS)
+- [x] `executors/file_ops.py` — `FileExecutor` with `copy_to_local / find_latest_file / acquire_lock / release_lock / open_in_explorer / open_file / with_temp_copy`
+- [x] ActionRouter desktop / rdp / file routing (`ROUTING_TABLE` + `plan.app` override)
+- [x] `ActionPlan` extended with `select_option / file_navigate / file_open / rdp_launch / rdp_reconnect / rdp_disconnect` action types and an `app` scope field
+- [x] `agent/perception.py` — `capture(target=bbox)` already accepts an mss bbox dict; RDP window bbox surfaced via `RDPHandler.window_bbox()`
+- [x] `agent/recovery.py` — `RecoveryHandler` returns `RecoveryDirective(retry / skip / rdp_reconnect / hitl / abort)` for blocking modals, error screens, RDP disconnects, transient errors, reconnect-limit, and unknown failures
+- [x] Hard retry cap added to `AgentLoop._store` — deterministic-mode steps now route to HITL after `RETRY_LIMIT=3` repeated failures (closes the infinite-retry hole found during validation)
+- [x] Task YAML for browser→RDP handoff (`config/tasks/rdp_launch.yaml`)
+- [x] Mock-based unit tests for desktop/rdp/file_ops (44 new tests; pywinauto + subprocess fully mocked — Windows runtime validation tracked in `docs/assumptions.md` A-06 / A-08 / A-09 / A-10 / A-11)
+
+End-to-end validation on macOS dev box:
+- `pytest tests/` → **94 passed** (50 from Phases 0-2 + 44 new).
+- Phase 2 regression: `LD_BASE_URL=file://.../sim/pages python run_agent.py --task config/tasks/claim_search.yaml --skip-preflight` → `agent_complete status=success exit_reason=task_complete steps=6`.
+- Phase 3 browser→RDP handoff: 4 browser steps succeed, `rdp_launch` raises the documented "mstsc is Windows-only" error (A-06), retry cap fires after 3 attempts, HITL routed cleanly, agent exits.
 
 ---
 

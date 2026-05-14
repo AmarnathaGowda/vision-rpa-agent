@@ -1,7 +1,11 @@
 """ActionRouter — dispatches an ActionPlan to the correct executor.
 
-Phase 2 routes only browser actions to BrowserExecutor; desktop/RDP land in
-Phase 3. The router is intentionally a small switch — no business logic.
+Routing strategy:
+1. If plan.app is set explicitly (browser/desktop/rdp/file), honour it.
+2. Otherwise fall back to ROUTING_TABLE keyed on action_type.
+
+This lets the same primitive (e.g. "click") run against either browser or
+desktop without inventing parallel action types.
 """
 from __future__ import annotations
 
@@ -12,8 +16,9 @@ from config.logging_config import get_logger
 
 log = get_logger(__name__)
 
-# action_type → "browser" | "desktop" | "rdp" | "noop"
+# action_type → "browser" | "desktop" | "rdp" | "file" | "noop"
 ROUTING_TABLE: dict[str, str] = {
+    # Generic browser primitives (default scope)
     "navigate": "browser",
     "click":    "browser",
     "type":     "browser",
@@ -21,9 +26,18 @@ ROUTING_TABLE: dict[str, str] = {
     "extract":  "browser",
     "wait":     "browser",
     "js_eval":  "browser",
-    # Phase 3 will add: select / window / file_explorer → "desktop"
+    # Desktop-only
+    "select_option": "desktop",
+    # File Explorer / network share
+    "file_navigate": "file",
+    "file_open":     "file",
+    # RDP lifecycle
+    "rdp_launch":     "rdp",
+    "rdp_reconnect":  "rdp",
+    "rdp_disconnect": "rdp",
+    # No-op
     "flag_human": "noop",
-    "noop":     "noop",
+    "noop":       "noop",
 }
 
 
@@ -31,36 +45,37 @@ class ActionRouter:
     def __init__(self,
                  browser: Any | None = None,
                  desktop: Any | None = None,
-                 rdp: Any | None = None) -> None:
+                 rdp: Any | None = None,
+                 file: Any | None = None) -> None:
         self.browser = browser
         self.desktop = desktop
         self.rdp = rdp
+        self.file = file
 
     def execute(self, plan: ActionPlan) -> ActionResult:
-        target_executor = ROUTING_TABLE.get(plan.action_type, "unknown")
+        scope = self._scope_for(plan)
 
-        if target_executor == "noop":
+        if scope == "noop":
             log.info("router_noop", action_type=plan.action_type, target=plan.target)
             return ActionResult(status="skipped",
                                 error_msg=f"noop for action_type={plan.action_type}")
 
-        if target_executor == "browser":
-            if self.browser is None:
-                return ActionResult(status="failed",
-                                    error_msg="no browser executor registered")
-            return self.browser.execute(plan)
+        executor = {
+            "browser": self.browser,
+            "desktop": self.desktop,
+            "rdp":     self.rdp,
+            "file":    self.file,
+        }.get(scope)
 
-        if target_executor == "desktop":
-            if self.desktop is None:
-                return ActionResult(status="failed",
-                                    error_msg="desktop executor not implemented (Phase 3)")
-            return self.desktop.execute(plan)
+        if executor is None:
+            return ActionResult(status="failed",
+                                error_msg=f"no {scope} executor registered for "
+                                          f"action_type={plan.action_type!r}")
 
-        if target_executor == "rdp":
-            if self.rdp is None:
-                return ActionResult(status="failed",
-                                    error_msg="rdp executor not implemented (Phase 3)")
-            return self.rdp.execute(plan)
+        log.debug("router_dispatch", scope=scope, action_type=plan.action_type)
+        return executor.execute(plan)
 
-        return ActionResult(status="failed",
-                            error_msg=f"unroutable action_type={plan.action_type!r}")
+    def _scope_for(self, plan: ActionPlan) -> str:
+        if plan.app and plan.app != "auto":
+            return plan.app
+        return ROUTING_TABLE.get(plan.action_type, "unknown")

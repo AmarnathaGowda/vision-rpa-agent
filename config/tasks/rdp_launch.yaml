@@ -1,0 +1,47 @@
+# Browser → RDP → desktop handoff demo.
+#
+# Real execution requires Windows + a reachable RDP host. On macOS / CI this
+# task will exit at the rdp_launch step with `rdp_error: mstsc is Windows-only
+# — see docs/assumptions.md A-06`, which is the documented behaviour.
+#
+# To actually run on the Windows agent host:
+#   poetry run python run_agent.py --task config/tasks/rdp_launch.yaml --skip-preflight
+task_id: rdp_handoff
+task_type: case4
+app: auto    # mixed — router picks scope per-step
+goal: "Log into the RD Web portal, download the .rdp file, launch an RDP session, and interact with a RemoteApp window."
+
+steps:
+  - action_type: navigate
+    target: "{{LD_BASE_URL}}/login.html"
+    app: browser
+    reason: "open RD Web portal"
+  - action_type: type
+    target: username
+    value: "{{RDWEB_USERNAME}}"
+    app: browser
+    reason: "fill username"
+  - action_type: type
+    target: password
+    value: "{{RDWEB_PASSWORD}}"
+    app: browser
+    reason: "fill password"
+  - action_type: click
+    target: sign_in
+    app: browser
+    reason: "submit credentials"
+  - action_type: rdp_launch
+    target: "{{RDP_FILE_PATH}}"
+    app: rdp
+    reason: "launch mstsc with the published .rdp file"
+  - action_type: click
+    target: "Remote.*::OK"   # window_re::element_target convention
+    app: desktop
+    reason: "dismiss any first-connect warning dialog"
+  - action_type: wait
+    target: "Remote.*::Welcome"
+    app: desktop
+    reason: "verify the RemoteApp window is interactive"
+  - action_type: rdp_disconnect
+    app: rdp
+    reason: "tidy up — keep audit clean"
