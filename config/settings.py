@@ -9,9 +9,52 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # LLM inference
+    # ── Runtime mode ──────────────────────────────────────────────────
+    # "client_onprem" (default, safe): only local providers allowed.
+    # "production":   only local providers allowed (same safety contract as
+    #                 client_onprem but signals a deployed environment).
+    # "demo":         external API providers permitted (OpenAI / Claude) for
+    #                 stakeholder presentations. NEVER enable in production.
+    runtime_mode: str = "client_onprem"
+
+    # LLM inference — local (Ollama / vLLM)
     inference_url: str = "http://localhost:11434/v1"
     model_name: str = "minicpm-v:latest"
+
+    # Provider selection: "ollama" (default, production) | "openai" / "claude" (demo only).
+    # Provider factory enforces the demo-mode gate; setting llm_provider=openai
+    # while runtime_mode != "demo" raises at startup.
+    llm_provider: str = "ollama"
+    llm_timeout_s: float = 120.0   # per-request timeout; 30.0 recommended for external APIs
+    llm_max_retries: int = 2       # tenacity retry attempts on transient errors
+
+    # Claude API (demo/testing only — never used in production)
+    # Set via ANTHROPIC_API_KEY env var or .env; never commit the key.
+    claude_model: str = "claude-sonnet-4-6"
+    anthropic_api_key: str = ""
+
+    # OpenAI API (demo/testing only — gated by runtime_mode=demo)
+    # Set via OPENAI_API_KEY env var or .env; never commit the key.
+    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str = ""
+
+    # ── Lightweight demo execution ────────────────────────────────────
+    # When True, demo runs trade accuracy for speed:
+    #   - perception downscales to LIGHTWEIGHT_MAX_DIMENSION
+    #   - max_tokens halved for plan/perception calls
+    #   - extraction skips OCR tier if pdfplumber meets threshold
+    lightweight_mode: bool = False
+    lightweight_max_dimension: int = 1024   # vs default 1600
+    lightweight_max_tokens: int = 256       # vs default 512/1024
+
+    # ── External-API redaction policy ─────────────────────────────────
+    # When the active provider is external (openai/claude) and this flag is
+    # True, prompts are passed through redaction.redact_prompt() before send.
+    redact_external_payloads: bool = True
+    # When True, attach redacted prompts to the audit log (helpful for QA;
+    # disable in client envs where even redacted payloads are sensitive).
+    audit_external_payloads: bool = False
 
     # Application URLs
     ld_base_url: str = "http://localhost:8000"

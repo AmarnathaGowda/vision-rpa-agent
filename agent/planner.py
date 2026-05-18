@@ -7,9 +7,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent.llm_client import get_client, strip_json_fence
+from agent.llm_client import strip_json_fence
+from agent.providers import LLMProvider, get_provider
+from agent.providers.legacy_adapter import _LegacyClientProvider
 from agent.schemas import ActionPlan, ScreenState
+from config.logging_config import get_logger
 from config.settings import settings
+
+log = get_logger(__name__)
 
 PLANNING_PROMPT = """You are an RPA action planner for insurance claim automation.
 
@@ -44,15 +49,70 @@ Rules:
 
 
 class ActionPlanner:
-    def __init__(self, client: Any | None = None, retry_limit: int = 3) -> None:
-        self._client = client
+    SOP_TOP_K = 2          # how many SOP chunks to inject per plan
+    SOP_MAX_CHARS = 1600   # truncate combined SOP text to stay within prompt budget
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        provider: LLMProvider | None = None,
+        retry_limit: int = 3,
+        knowledge: Any | None = None,
+    ) -> None:
+        # ``provider`` preferred; ``client`` wrapped for backward compat.
+        if provider is not None:
+            self._provider: LLMProvider | None = provider
+        elif client is not None:
+            self._provider = _LegacyClientProvider(client)
+        else:
+            self._provider = None
         self.retry_limit = retry_limit
+        # ``knowledge`` is a KnowledgeStore — typically ChromaKnowledgeStore in
+        # production, NullKnowledgeStore in tests/CI. Resolved lazily so the
+        # planner doesn't try to open Chroma when SOPs are unused.
+        self._knowledge = knowledge
 
     @property
-    def client(self) -> Any:
-        if self._client is None:
-            self._client = get_client()
-        return self._client
+    def knowledge(self):
+        if self._knowledge is None:
+            from memory.knowledge import get_knowledge_store
+            self._knowledge = get_knowledge_store()
+        return self._knowledge
+
+    def _sop_context(self, goal: str, screen_summary: str) -> str:
+        """Return a 'SOP CONTEXT' block to inject into the system prompt, or ''
+        if no relevant chunks are available. Failures are swallowed — SOP
+        retrieval is an enhancement, not a hard dependency."""
+        try:
+            query = f"{goal}\n{screen_summary}".strip()
+            hits = self.knowledge.query_sop(query, k=self.SOP_TOP_K)
+        except Exception as e:  # noqa: BLE001 — never block a plan on retrieval
+            log.warning("sop_query_failed", error=str(e))
+            return ""
+        if not hits:
+            return ""
+        parts: list[str] = []
+        total = 0
+        for h in hits:
+            src = (h.metadata or {}).get("source", "sop")
+            block = f"[SOP — {src}]\n{h.text}".strip()
+            if total + len(block) > self.SOP_MAX_CHARS:
+                break
+            parts.append(block)
+            total += len(block) + 2
+        if not parts:
+            return ""
+        return (
+            "RELEVANT SOP GUIDANCE (retrieved by similarity to the current "
+            "task/screen — follow only when applicable):\n\n"
+            + "\n\n".join(parts)
+        )
+
+    @property
+    def _active_provider(self) -> LLMProvider:
+        if self._provider is None:
+            self._provider = get_provider()
+        return self._provider
 
     def decide(
         self,
@@ -68,7 +128,7 @@ class ActionPlanner:
 
         prompt = PLANNING_PROMPT.format(
             goal=goal,
-            completed=working.get("decisions_log", [])[-5:],
+            completed=working.get("decisions_log", [])[-3:],
             state_summary=screen_state.state_summary,
             elements=json.dumps([e.model_dump() for e in screen_state.visible_elements]),
             last_result=working.get("last_result") or "none",
@@ -78,13 +138,20 @@ class ActionPlanner:
             retry_limit=self.retry_limit,
         )
 
-        response = self.client.chat.completions.create(
-            model=settings.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=512,
-            temperature=0.1,
+        sop_block = self._sop_context(goal=goal,
+                                      screen_summary=screen_state.state_summary)
+        messages: list[dict] = []
+        if sop_block:
+            messages.append({"role": "system", "content": sop_block})
+        messages.append({"role": "user", "content": prompt})
+
+        raw = strip_json_fence(
+            self._active_provider.complete(
+                messages=messages,
+                max_tokens=512,
+                temperature=0.1,
+            )
         )
-        raw = strip_json_fence(response.choices[0].message.content or "")
         data = json.loads(raw)
         plan = ActionPlan(**data)
 

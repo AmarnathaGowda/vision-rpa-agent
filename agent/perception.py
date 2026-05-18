@@ -13,10 +13,11 @@ from typing import Any
 from PIL import Image
 from pydantic import ValidationError
 
-from agent.llm_client import get_client, strip_json_fence
+from agent.llm_client import strip_json_fence
+from agent.providers import LLMProvider, get_provider
+from agent.providers.legacy_adapter import _LegacyClientProvider
 from agent.schemas import ScreenState
 from config.logging_config import get_logger
-from config.settings import settings
 
 log = get_logger(__name__)
 
@@ -53,20 +54,47 @@ Current step: {step}
 """
 
 # Downscale very large screens — VLM cost scales with pixels.
+# In lightweight demo mode, ``settings.lightweight_max_dimension`` overrides.
 MAX_DIMENSION = 1600
 
 
-class PerceptionLayer:
-    """mss capture + Pillow preprocess + local VLM call."""
+def _active_max_dimension() -> int:
+    from config.settings import settings
+    if getattr(settings, "lightweight_mode", False):
+        return int(getattr(settings, "lightweight_max_dimension", 1024))
+    return MAX_DIMENSION
 
-    def __init__(self, client: Any | None = None) -> None:
-        self._client = client  # injectable for tests; resolves lazily
+
+def _active_max_tokens(default: int) -> int:
+    from config.settings import settings
+    if getattr(settings, "lightweight_mode", False):
+        return int(getattr(settings, "lightweight_max_tokens", 256))
+    return default
+
+
+class PerceptionLayer:
+    """mss capture + Pillow preprocess + LLM provider call."""
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        provider: LLMProvider | None = None,
+    ) -> None:
+        # ``provider`` is the preferred injection point (new code + tests).
+        # ``client`` is kept for backward compat: an OpenAI-compatible client
+        # (real or mock) is wrapped transparently in _LegacyClientProvider.
+        if provider is not None:
+            self._provider: LLMProvider | None = provider
+        elif client is not None:
+            self._provider = _LegacyClientProvider(client)
+        else:
+            self._provider = None  # resolved lazily via get_provider()
 
     @property
-    def client(self) -> Any:
-        if self._client is None:
-            self._client = get_client()
-        return self._client
+    def _active_provider(self) -> LLMProvider:
+        if self._provider is None:
+            self._provider = get_provider()
+        return self._provider
 
     def capture(self, target: dict | None = None) -> Image.Image:
         """Grab the primary monitor or a specific bbox.
@@ -88,8 +116,9 @@ class PerceptionLayer:
             image = image.convert("RGB")
         w, h = image.size
         m = max(w, h)
-        if m > MAX_DIMENSION:
-            scale = MAX_DIMENSION / m
+        cap = _active_max_dimension()
+        if m > cap:
+            scale = cap / m
             image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         return image
 
@@ -104,21 +133,14 @@ class PerceptionLayer:
             step=context.get("step", 0),
         )
 
-        response = self.client.chat.completions.create(
-            model=settings.model_name,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            max_tokens=1024,
-            temperature=0.1,
+        raw = strip_json_fence(
+            self._active_provider.complete_with_image(
+                image_b64=b64,
+                mime="image/png",
+                prompt=prompt,
+                max_tokens=_active_max_tokens(1024),
+            )
         )
-
-        raw = strip_json_fence(response.choices[0].message.content or "")
         return self._parse_screen_state(raw)
 
     def _parse_screen_state(self, raw: str) -> ScreenState:

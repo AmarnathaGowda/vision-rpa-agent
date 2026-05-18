@@ -28,7 +28,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from agent.llm_client import get_client, strip_json_fence
+from agent.llm_client import strip_json_fence
+from agent.providers import LLMProvider, get_provider
+from agent.providers.legacy_adapter import _LegacyClientProvider
 from config.logging_config import get_logger
 from config.settings import settings
 
@@ -93,20 +95,27 @@ class ExtractionPipeline:
 
     def __init__(self,
                  vlm_client: Any | None = None,
+                 vlm_provider: LLMProvider | None = None,
                  _pdfplumber: Any | None = None,
                  _fitz: Any | None = None,
                  _tesseract: Any | None = None) -> None:
-        self._vlm_client = vlm_client
+        # ``vlm_provider`` preferred; ``vlm_client`` wrapped for backward compat.
+        if vlm_provider is not None:
+            self._vlm_provider: LLMProvider | None = vlm_provider
+        elif vlm_client is not None:
+            self._vlm_provider = _LegacyClientProvider(vlm_client)
+        else:
+            self._vlm_provider = None
         # Injectable for tests; real deps imported lazily.
         self._pdfplumber = _pdfplumber
         self._fitz = _fitz
         self._tesseract = _tesseract
 
     @property
-    def vlm_client(self) -> Any:
-        if self._vlm_client is None:
-            self._vlm_client = get_client()
-        return self._vlm_client
+    def _active_vlm_provider(self) -> LLMProvider:
+        if self._vlm_provider is None:
+            self._vlm_provider = get_provider()
+        return self._vlm_provider
 
     # ── public entry point ──────────────────────────────────────────────────
     def extract(self, document: str | Path,
@@ -247,21 +256,17 @@ class ExtractionPipeline:
         field_list = ", ".join(s.name for s in specs)
         prompt = _VLM_PROMPT.format(fields=field_list)
         try:
-            resp = self.vlm_client.chat.completions.create(
-                model=settings.model_name,
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": prompt},
-                ]}],
+            raw_text = self._active_vlm_provider.complete_with_image(
+                image_b64=b64,
+                mime="image/png",
+                prompt=prompt,
                 max_tokens=1024,
-                temperature=0.0,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("vlm_call_failed", page=page_no, error=str(e))
             return
 
-        raw = strip_json_fence(resp.choices[0].message.content or "")
+        raw = strip_json_fence(raw_text)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:

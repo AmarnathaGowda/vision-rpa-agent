@@ -53,10 +53,12 @@ class KnowledgeStore(Protocol):
                          k: int = 1) -> list[KnowledgeHit]: ...
     def query_error_recovery(self, error_text: str, app: str,
                              k: int = 1) -> list[KnowledgeHit]: ...
+    def query_sop(self, query: str, k: int = 3) -> list[KnowledgeHit]: ...
     def store_ui_pattern(self, app: str, element_desc: str,
                          selector: str, action_type: str) -> None: ...
     def store_error_recovery(self, error_pattern: str, app: str,
                              recovery_action: str, succeeded: bool) -> None: ...
+    def upsert_sop_chunks(self, chunks: list) -> int: ...
     def flush(self) -> int: ...
     def reset(self) -> None: ...
 
@@ -73,6 +75,9 @@ class NullKnowledgeStore:
                              k: int = 1) -> list[KnowledgeHit]:
         return []
 
+    def query_sop(self, query: str, k: int = 3) -> list[KnowledgeHit]:
+        return []
+
     def store_ui_pattern(self, app: str, element_desc: str,
                          selector: str, action_type: str) -> None:
         log.debug("knowledge_null_store_ui_pattern", app=app, desc=element_desc)
@@ -81,11 +86,36 @@ class NullKnowledgeStore:
                              recovery_action: str, succeeded: bool) -> None:
         log.debug("knowledge_null_store_error", app=app, succeeded=succeeded)
 
+    def upsert_sop_chunks(self, chunks: list) -> int:
+        log.debug("knowledge_null_upsert_sop", count=len(chunks))
+        return 0
+
     def flush(self) -> int:
         return 0
 
     def reset(self) -> None:
         return
+
+
+# ── default embedder (CPU-only) ─────────────────────────────────────────────
+def _safe_default_embedder():
+    """Return chromadb's default MiniLM embedder pinned to CPU.
+
+    Chromadb's default ``ONNXMiniLM_L6_V2`` picks ``CoreMLExecutionProvider``
+    first on macOS, which is unstable on some Apple GPUs and silently fails
+    the upsert with status -1. Forcing ``CPUExecutionProvider`` avoids the
+    crash; the model is tiny so CPU inference is fast enough for ingest.
+
+    Returns ``None`` (i.e. let chromadb fall back to its default) if the
+    embedder class isn't importable — keeps the store working on older
+    chromadb versions.
+    """
+    try:
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+        return ONNXMiniLM_L6_V2(preferred_providers=["CPUExecutionProvider"])
+    except Exception as e:  # noqa: BLE001 — never break store init on embedder issues
+        log.warning("default_embedder_fallback", error=str(e))
+        return None
 
 
 # ── chroma backend ──────────────────────────────────────────────────────────
@@ -99,6 +129,12 @@ class ChromaKnowledgeStore:
     UI_COLLECTION = "ui_patterns"
     ERR_COLLECTION = "error_recoveries"
     TASK_COLLECTION = "task_templates"
+    SOP_COLLECTION = "sop_chunks"
+    # Embedding model is whatever chromadb uses by default
+    # (sentence-transformers all-MiniLM-L6-v2 as of chromadb 0.5). Switching
+    # this requires re-ingesting all SOPs — vectors live in the model's space.
+    # Upgrade seam: pass `embedding_function=` to get_or_create_collection
+    # below to swap in Ollama or OpenAI embeddings.
 
     def __init__(self, path: str | None = None,
                  telemetry: bool = False,
@@ -112,9 +148,15 @@ class ChromaKnowledgeStore:
                 path=path or settings.chroma_path,
                 settings=ChromaSettings(anonymized_telemetry=telemetry),
             )
-        self.ui = self._client.get_or_create_collection(self.UI_COLLECTION)
-        self.err = self._client.get_or_create_collection(self.ERR_COLLECTION)
-        self.task = self._client.get_or_create_collection(self.TASK_COLLECTION)
+        embed_fn = _safe_default_embedder()
+        self.ui = self._client.get_or_create_collection(
+            self.UI_COLLECTION, embedding_function=embed_fn)
+        self.err = self._client.get_or_create_collection(
+            self.ERR_COLLECTION, embedding_function=embed_fn)
+        self.task = self._client.get_or_create_collection(
+            self.TASK_COLLECTION, embedding_function=embed_fn)
+        self.sop = self._client.get_or_create_collection(
+            self.SOP_COLLECTION, embedding_function=embed_fn)
         self._pending: list[PendingWrite] = []
 
     # ── queries (mid-task) ──────────────────────────────────────────────────
@@ -125,6 +167,31 @@ class ChromaKnowledgeStore:
     def query_error_recovery(self, error_text: str, app: str,
                              k: int = 1) -> list[KnowledgeHit]:
         return self._query(self.err, query=error_text, where={"app": app}, k=k)
+
+    def query_sop(self, query: str, k: int = 3) -> list[KnowledgeHit]:
+        """Retrieve top-k SOP chunks for a goal/state query.
+
+        Org-wide collection — no ``where`` filter today. When per-client
+        overlays are added, pass ``where={"client_id": <id>}`` here.
+        """
+        return self._query(self.sop, query=query, where=None, k=k)
+
+    def upsert_sop_chunks(self, chunks: list) -> int:
+        """Bulk upsert SOP chunks — used by the ingest CLI. Writes
+        immediately (unlike ui/err pending writes), because ingest is a
+        one-shot offline process, not part of a running task."""
+        if not chunks:
+            return 0
+        try:
+            self.sop.upsert(
+                ids=[c.id for c in chunks],
+                documents=[c.text for c in chunks],
+                metadatas=[c.metadata for c in chunks],
+            )
+            return len(chunks)
+        except Exception as e:  # noqa: BLE001 — surface but don't crash ingest
+            log.warning("sop_upsert_failed", count=len(chunks), error=str(e))
+            return 0
 
     def _query(self, collection, query: str, where: dict | None, k: int) -> list[KnowledgeHit]:
         if collection.count() == 0:
