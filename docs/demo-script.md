@@ -37,7 +37,27 @@ Talking points:
 
 ---
 
-## Act 2 — Watch an agent work (5 min)
+## Act 2a — Live VLM run against the local sim (5 min)
+
+If a local sim is up (LossDraft on `:8000/lossdrafts/document-management`,
+IIM on `:8000/proctor/loan-search`, RD Web on
+`:8000/rdweb/pages/en-US/login.aspx`), use the VLM-driven task YAMLs:
+
+```bash
+ollama serve &
+ollama pull minicpm-v          # first run only
+poetry run python run_agent.py --task config/tasks/sim_live_lossdraft.yaml
+poetry run python run_agent.py --task config/tasks/sim_live_iim.yaml
+poetry run python run_agent.py --task config/tasks/sim_live_rdweb.yaml
+```
+
+These have no deterministic `steps:` — the agent runs the real
+observe → reason → act loop, so the audience sees mss capture, VLM
+inference, and Playwright execution actually firing. The RD Web task is
+designed to trip HITL on the password field, which is the perfect cue
+to switch over to the dashboard demo.
+
+## Act 2b — Watch an agent work (5 min)
 
 ### Step 1: Happy-path run against the vendored sim
 

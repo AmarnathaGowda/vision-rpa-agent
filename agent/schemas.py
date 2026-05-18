@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 AppType = Literal["browser", "desktop", "rdp", "file_explorer", "dialog", "unknown"]
 TaskProgress = Literal["not_started", "in_progress", "blocked", "complete"]
@@ -61,6 +61,18 @@ class ActionPlan(BaseModel):
     # action_type. Set explicitly to override (e.g. when "click" should hit a
     # desktop app instead of the browser).
     app: ExecutorScope = "auto"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_null_strings(cls, data):
+        # Local VLMs (Ollama/minicpm-v) routinely emit "field": null for
+        # optional string fields. Coerce None → "" so we don't trip Pydantic
+        # on every plan.
+        if isinstance(data, dict):
+            for key in ("target", "value", "reason", "fallback"):
+                if data.get(key) is None:
+                    data[key] = ""
+        return data
 
     @field_validator("confidence")
     @classmethod

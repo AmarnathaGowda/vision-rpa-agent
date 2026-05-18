@@ -1,0 +1,13 @@
+# VLM-driven sim run against the local IIM (Proctor) simulation.
+#
+# Read-only screen-recognition test — agent navigates, perceives, plans, and
+# stops after reporting visible elements. No write actions.
+
+task_id: sim_live_iim
+task_type: case3
+app: browser
+goal: |
+  Open the URL http://localhost:8000/proctor/loan-search in the current
+  browser tab. Once the loan search page is visible, identify the search
+  input field, the search button, and any visible filter dropdowns. Report
+  what fields are present. Do not submit a search or modify any record.

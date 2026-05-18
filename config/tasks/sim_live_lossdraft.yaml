@@ -1,0 +1,25 @@
+# VLM-driven sim run against the local LossDraft simulation.
+#
+# This task INTENTIONALLY omits the `steps:` list so the agent uses the real
+# observe → reason → act loop:
+#   1. mss captures the primary monitor (browser must be visible/foreground)
+#   2. local VLM (Ollama / minicpm-v) produces a ScreenState JSON
+#   3. ActionPlanner returns an ActionPlan (single action)
+#   4. BrowserExecutor performs it via Playwright selectors
+#
+# Pre-requisites:
+#   - sim server running on :8000 with the path below
+#   - ollama serve  +  ollama pull minicpm-v
+#   - HEADLESS=false (default) so mss can see the browser
+#
+# Run:
+#   poetry run python run_agent.py --task config/tasks/sim_live_lossdraft.yaml
+
+task_id: sim_live_lossdraft
+task_type: case2
+app: browser
+goal: |
+  Open the URL http://localhost:8000/lossdrafts/document-management in the
+  current browser tab. Once the document management page is visible,
+  identify and report the visible fields, buttons, and any document rows.
+  Do not submit, delete, or modify any record — read-only inspection only.

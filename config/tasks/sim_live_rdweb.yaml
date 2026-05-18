@@ -1,0 +1,17 @@
+# VLM-driven sim run against the local RD Web login page.
+#
+# Tests browser perception against an ASPX form. The agent should recognise
+# the username + password fields and the sign-in button. HITL pause is
+# EXPECTED on the password field — credentials are never auto-filled by
+# the agent without a human approval gate on the first 10 runs
+# (CLAUDE.md non-negotiable).
+
+task_id: sim_live_rdweb_login
+task_type: case1
+app: browser
+goal: |
+  Open http://localhost:8000/rdweb/pages/en-US/login.aspx in the current
+  browser tab. Identify the username field, password field, and the sign-in
+  button. Type the username 'automation_user' into the username field, then
+  STOP and flag for human approval before typing the password or clicking
+  sign in. Do not submit the form.
