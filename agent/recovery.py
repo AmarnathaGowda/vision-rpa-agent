@@ -88,10 +88,28 @@ class RecoveryHandler:
                 ),
             )
         if screen.error_present:
-            log.info("recovery_error_present", issue=screen.blocking_issue)
+            issue = (screen.blocking_issue or "").strip()
+            issue_lower = issue.lower()
+            # HTML5 / form-validation messages (e.g. "Please fill in this
+            # field", "Required") are RECOVERABLE by the planner — it can
+            # re-plan to fill the missing input. Don't escalate to HITL
+            # on these; let the loop continue and re-reason.
+            FORM_VALIDATION_MARKERS = (
+                "please fill in this field",
+                "please select",
+                "this field is required",
+                "required field",
+                "must be filled",
+                "fill out this field",
+            )
+            if any(m in issue_lower for m in FORM_VALIDATION_MARKERS):
+                log.info("recovery_form_validation_skipped",
+                         issue=issue, hint="letting planner re-reason")
+                return None  # NO recovery — fall through to normal planning
+            log.info("recovery_error_present", issue=issue)
             return RecoveryDirective(
                 action="hitl",
-                reason=f"error_present: {screen.blocking_issue or 'unspecified'}",
+                reason=f"error_present: {issue or 'unspecified'}",
             )
         return None
 

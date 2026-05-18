@@ -84,9 +84,17 @@ class SelectorResolver:
         yield f"[aria-label*='{target}' i]", "aria"
         yield f"[name='{target}']", "name"
         yield f"#{target}", "name"           # id selector
-        yield f"text={target}", "text"
+        # Tag-specific text matches BEFORE plain text=. Pages frequently
+        # have multiple elements containing the same text (e.g. an <h1>
+        # "Sign On" plus a <button>"Sign On"). Without this ordering,
+        # plain text= picks the first DOM hit (often the heading) and the
+        # subsequent click is a no-op. Tag-narrowed selectors disambiguate.
         yield f"button:has-text({target!r})", "text"
         yield f"a:has-text({target!r})", "text"
+        yield f"input[type='submit'][value={target!r}]", "text"
+        yield f"input[type='button'][value={target!r}]", "text"
+        yield f"[role='button']:has-text({target!r})", "text"
+        yield f"text={target}", "text"
 
     @staticmethod
     def _looks_like_raw_selector(s: str) -> bool:

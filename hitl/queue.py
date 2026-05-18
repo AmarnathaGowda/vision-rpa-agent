@@ -47,6 +47,7 @@ class HumanGuidance:
     """
     instruction: str = ""
     corrected_target: str | None = None    # e.g. "Domain\\user name"
+    corrected_value: str | None = None     # e.g. "vsonawane001" — value to TYPE
     selector_hint: str | None = None       # e.g. "[data-testid='login-username']"
     save_to_memory: bool = False           # → ui_patterns collection
     save_to_sop: bool = False              # → sop_chunks collection
@@ -57,6 +58,7 @@ class HumanGuidance:
         return {
             "instruction": _scrub_instruction(self.instruction),
             "corrected_target": self.corrected_target,
+            "corrected_value": self.corrected_value,
             "selector_hint": self.selector_hint,
             "save_to_memory": bool(self.save_to_memory),
             "save_to_sop": bool(self.save_to_sop),
@@ -68,13 +70,14 @@ class HumanGuidance:
     def from_resolution(cls, resolution: dict) -> "HumanGuidance | None":
         """Extract a HumanGuidance from a resolution dict if guidance fields
         are present. Returns None for control-only resolutions."""
-        keys = ("instruction", "corrected_target", "selector_hint",
-                "save_to_memory", "save_to_sop")
+        keys = ("instruction", "corrected_target", "corrected_value",
+                "selector_hint", "save_to_memory", "save_to_sop")
         if not any(resolution.get(k) for k in keys):
             return None
         return cls(
             instruction=resolution.get("instruction", "") or "",
             corrected_target=resolution.get("corrected_target") or None,
+            corrected_value=resolution.get("corrected_value") or None,
             selector_hint=resolution.get("selector_hint") or None,
             save_to_memory=bool(resolution.get("save_to_memory", False)),
             save_to_sop=bool(resolution.get("save_to_sop", False)),
@@ -402,6 +405,25 @@ class HITLQueue:
             # Best-effort knowledge persistence — failures log but never
             # abort the resume (memory is an enhancement, not a hard dep).
             self._persist_guidance_to_knowledge(guidance, working)
+            # Deterministic override: if the operator gave both a target
+            # AND a value, build the type action they clearly want next.
+            # The loop's _reason() picks this up and runs it without
+            # calling the LLM — guarantees their input takes effect.
+            if guidance.corrected_target and guidance.corrected_value is not None:
+                working.extracted_values["next_action_override"] = {
+                    "action_type": "type",
+                    "target": guidance.corrected_target,
+                    "value": guidance.corrected_value,
+                    "reason": (f"operator-supplied: type {guidance.corrected_value!r} "
+                               f"into {guidance.corrected_target!r}"),
+                    "confidence": 1.0,
+                    "requires_hitl": False,
+                    "cache_hit": True,
+                }
+                log.info("hitl_value_override_queued",
+                         task_id=working.task_id,
+                         target=guidance.corrected_target,
+                         value_length=len(guidance.corrected_value))
             # When guidance has no corrected target / selector but reads
             # like a "go ahead" instruction (e.g. "please proceed"), and the
             # paused plan was a flag_human gate, the operator clearly means

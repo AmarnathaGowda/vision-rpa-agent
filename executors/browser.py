@@ -77,6 +77,13 @@ class UnresolvedCredentialError(RuntimeError):
         super().__init__(f"unresolved credentials: {keys}")
         self.keys = keys
 
+
+class WrongElementForTypeError(RuntimeError):
+    """Raised when an LLM-emitted `type` action targets a non-input element
+    (button, link, label, etc.). Surfaces a clearer error than Playwright's
+    raw 'Element is not an <input>' so the recovery handler can classify
+    it as a planning bug (operator should pick a different target)."""
+
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page
 
@@ -186,6 +193,13 @@ class BrowserExecutor:
                 error_msg=f"unresolved_credentials: {', '.join(e.keys)}",
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
+        except WrongElementForTypeError as e:
+            log.warning("type_on_non_input", target=plan.target, error=str(e))
+            return ActionResult(
+                status="failed",
+                error_msg=f"wrong_element_for_type: {e}",
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
         except Exception as e:  # noqa: BLE001 — last-line safety net
             log.exception("browser_action_failed", action=plan.action_type, target=plan.target)
             return ActionResult(
@@ -213,6 +227,11 @@ class BrowserExecutor:
         if plan.action_type == "click":
             self.click(plan.target, fallback=plan.fallback)
             return "", self._snap(plan)
+        if plan.action_type == "click_download_open":
+            launch_url = self.click_download_open(plan.target, fallback=plan.fallback)
+            # Return the launched URL so the loop can record it in working
+            # memory (e.g. as `pdf_url` or `launcher_url`).
+            return launch_url or "", self._snap(plan)
         if plan.action_type == "type":
             self.fill(plan.target, resolved_value, fallback=plan.fallback)
             return "", self._snap(plan)
@@ -242,12 +261,118 @@ class BrowserExecutor:
 
     def click(self, target: str, fallback: str | None = None) -> None:
         sel = self.resolver.resolve(self.page, target, fallback=fallback)
-        self.page.locator(sel.selector).first.click(timeout=self.DEFAULT_TIMEOUT_MS)
+        # no_wait_after=True — don't block waiting for navigation that the
+        # click might trigger. The next perception iteration will see the
+        # new page state. Slow simulators / SSO redirects would otherwise
+        # exceed DEFAULT_TIMEOUT_MS even though the click itself worked.
+        try:
+            self.page.locator(sel.selector).first.click(
+                timeout=self.DEFAULT_TIMEOUT_MS,
+                no_wait_after=True,
+            )
+        except TypeError:
+            # Older Playwright API may not accept no_wait_after on Locator.click
+            # — fall back without the kwarg.
+            self.page.locator(sel.selector).first.click(timeout=self.DEFAULT_TIMEOUT_MS)
         log.info("browser_click", target=target, selector=sel.selector, strategy=sel.strategy)
+
+    def click_download_open(self, target: str,
+                              fallback: str | None = None) -> str:
+        """Click a link that triggers a file download, capture the file,
+        and (if it's an HTML launcher with a meta-refresh URL) navigate
+        the current tab to that URL.
+
+        Returns the final URL that the tab was navigated to (empty string
+        if no meta-refresh was found in the downloaded file).
+
+        Used for the RDWeb "click Loss Drafts → download HTML launcher
+        with meta-refresh → land at /lossdrafts/" pattern. The launcher
+        file itself is also saved to ``settings.download_dir`` for audit.
+        """
+        import re as _re
+        sel = self.resolver.resolve(self.page, target, fallback=fallback)
+        log.info("browser_click_download_open_start",
+                 target=target, selector=sel.selector, strategy=sel.strategy)
+
+        # expect_download wraps the click — Playwright records the download
+        # event that the click triggers. The click itself can complete
+        # immediately because the download is being processed in the BG.
+        with self.page.expect_download(timeout=self.DEFAULT_TIMEOUT_MS * 2) as dl_info:
+            self.page.locator(sel.selector).first.click(
+                timeout=self.DEFAULT_TIMEOUT_MS,
+                no_wait_after=True,
+            )
+        download = dl_info.value
+        saved_path = self.screenshot_dir.parent / "downloads" / download.suggested_filename
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        download.save_as(str(saved_path))
+        log.info("browser_download_saved",
+                 path=str(saved_path),
+                 suggested=download.suggested_filename)
+
+        # Try to parse the meta-refresh URL out of the launcher HTML.
+        try:
+            body = saved_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log.warning("browser_download_read_failed", error=str(e))
+            return ""
+        m = _re.search(
+            r'<meta\s+http-equiv="refresh"\s+content="\d+;\s*url=([^"]+)"',
+            body, _re.IGNORECASE,
+        )
+        if not m:
+            # Not an HTML launcher with a redirect — the caller (LLM /
+            # next loop iteration) will need to handle the file directly.
+            log.info("browser_download_no_meta_refresh",
+                     path=str(saved_path),
+                     hint="file saved; no auto-navigation performed")
+            return ""
+
+        launch_url = m.group(1).strip()
+        if not launch_url.startswith("http"):
+            # Relative — resolve against the current page origin.
+            from urllib.parse import urljoin
+            launch_url = urljoin(self.page.url, launch_url)
+        log.info("browser_download_meta_refresh", launch_url=launch_url)
+
+        # Navigate the existing tab to the launcher's target URL.
+        self.page.goto(launch_url, wait_until="domcontentloaded",
+                        timeout=self.DEFAULT_TIMEOUT_MS * 2)
+        return launch_url
 
     def fill(self, target: str, value: str, fallback: str | None = None) -> None:
         sel = self.resolver.resolve(self.page, target, fallback=fallback)
-        self.page.locator(sel.selector).first.fill(value, timeout=self.DEFAULT_TIMEOUT_MS)
+        locator = self.page.locator(sel.selector).first
+        # Reject `type` on non-input elements early. The LLM frequently
+        # picks button/link/label text as a target for type — Playwright's
+        # own error is recoverable but unclear. Surface a typed,
+        # actionable failure so the next plan iteration sees what's wrong.
+        try:
+            tag = (locator.evaluate("el => el.tagName", timeout=1_000) or "").lower()
+        except Exception:  # noqa: BLE001 — locator might have detached; let fill() raise
+            tag = ""
+        # `<label>` is FINE — Playwright's fill() transparently follows the
+        # label's `for`/`htmlFor` attribute to the associated input. The
+        # planner often picks the label's text (e.g. "Domain\user name")
+        # because it's the most visible anchor on the page. Block only the
+        # truly wrong tags (button/a/etc.) where fill() will fail loudly.
+        BLOCKED_TAGS = {"button", "a", "div", "span", "p", "h1", "h2", "h3",
+                        "h4", "h5", "h6", "img", "svg"}
+        if tag in BLOCKED_TAGS:
+            # Allow contenteditable elements through (rare but valid).
+            try:
+                editable = bool(locator.evaluate("el => el.isContentEditable",
+                                                  timeout=500))
+            except Exception:  # noqa: BLE001
+                editable = False
+            if not editable:
+                raise WrongElementForTypeError(
+                    f"target {target!r} resolved to <{tag}> via {sel.strategy} "
+                    f"— `type` requires an input/textarea/select (or a label "
+                    f"that points to one). The LLM likely picked the submit "
+                    f"button. Re-plan with the actual input field's target."
+                )
+        locator.fill(value, timeout=self.DEFAULT_TIMEOUT_MS)
         log.info("browser_fill", target=target, selector=sel.selector,
                  strategy=sel.strategy, length=len(value))
 

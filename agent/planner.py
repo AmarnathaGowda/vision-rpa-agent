@@ -20,6 +20,8 @@ log = get_logger(__name__)
 PLANNING_PROMPT = """You are an RPA action planner for insurance claim automation.
 
 TASK GOAL: {goal}
+CURRENT WORKFLOW STAGE: {current_stage}
+STAGES ALREADY COMPLETED: {stages_completed}
 ACTIONS ALREADY DONE (most recent last — do NOT repeat any of these
 unless the screen shows the previous action did not take effect):
 {completed}
@@ -32,7 +34,7 @@ RETRY COUNT THIS STEP: {retry_count}
 
 Choose the single next action. Return ONLY valid JSON:
 {{
-  "action_type": "click|type|navigate|read|extract|wait|flag_human|js_eval|task_complete",
+  "action_type": "click|type|navigate|read|extract|wait|flag_human|js_eval|task_complete|click_download_open",
   "target": "<element description or selector>",
   "value": "<text to type, URL, or JS expression>",
   "reason": "<why this action>",
@@ -50,6 +52,18 @@ TASK COMPLETION:
 - task_complete is the ONLY way to end an LLM-driven task. If you keep
   emitting flag_human or other actions after the goal is met, the loop
   will eventually trip the duplicate-plan guardrail.
+
+WORKFLOW STAGES:
+- For multi-stage tasks, the goal lists the sequence of stages and the
+  exit criteria for each. Working memory tracks `current_stage` and
+  `stages_completed`.
+- When you see clear evidence the current stage's exit criteria are met
+  AND another stage remains, emit action_type "stage_complete" with
+  target=<next_stage_id> (matching the names in the goal). This advances
+  the workflow without ending the task.
+- Emit task_complete ONLY when the FINAL stage's exit criteria are met
+  (or when working memory has all keys listed under done_when in the
+  task YAML).
 
 Rules:
 - One action only.
@@ -77,6 +91,36 @@ text, the framework substitutes them at action time):
 - Any other key the operator has set in .env can be referenced as {{KEY}}
 NEVER emit a plan with `value: "rdweb_username"` (the bare name) —
 that types the literal string into the form. Always use `{{ }}`.
+
+ACTION ↔ ELEMENT TYPE RULES (most common LLM mistake):
+- `type` actions ONLY target form INPUTS (<input>, <textarea>, <select>).
+  NEVER target a label, button, link, or div for `type` — the framework
+  will reject it with a "wrong_element_for_type" error.
+- After filling all visible input fields, the NEXT action is usually
+  `click` on the submit button — NOT another `type`.
+- Read the visible_elements list carefully: only entries whose `type` is
+  "field" are valid `type` targets. Entries with type "button" require
+  a `click` action.
+
+CLICK-THAT-DOWNLOADS-A-LAUNCHER:
+- If the goal/SOP says clicking a button or tile will trigger a file
+  download (RDWeb "Loss Drafts" tile is the canonical example — clicking
+  it downloads an HTML launcher whose meta-refresh redirects to the real
+  app URL), emit action_type=`click_download_open` (NOT plain `click`).
+- The framework will: capture the download, parse the meta-refresh URL,
+  and navigate the current tab to that URL automatically.
+- Use plain `click` for buttons that DO NOT trigger downloads (e.g.
+  Sign-in, regular folder tiles).
+
+FORM-COMPLETENESS RULE (do not rush past empty fields):
+- Before emitting `click` on a Submit / Sign-in / OK button, verify
+  EVERY visible input field has been filled. Check the previous "ACTIONS
+  ALREADY DONE" list — if it contains, say, "type into username" but NOT
+  "type into password", you MUST emit `type` on the password field NEXT.
+  Do NOT click submit yet.
+- If the screen shows a form-validation message like "Please fill in
+  this field" or "Required", look at which input is highlighted in the
+  screenshot — that is the field you need to type into NEXT.
 
 SELECTOR RULES (critical — selector miss is the most common failure):
 - The "target" field MUST be one of the following, in priority order:
@@ -305,6 +349,8 @@ class ActionPlanner:
 
         prompt = PLANNING_PROMPT.format(
             goal=goal,
+            current_stage=working.get("current_stage") or "(none — single-stage task)",
+            stages_completed=", ".join(working.get("stages_completed") or []) or "(none)",
             completed=self._format_decisions(working.get("decisions_log", [])),
             current_url=screen_state.current_url or "(unknown)",
             state_summary=screen_state.state_summary,
@@ -341,8 +387,30 @@ class ActionPlanner:
         data = json.loads(raw)
         plan = ActionPlan(**data)
 
+        # Apply deterministic plan rewrites BEFORE HITL classification.
+        # These turn common LLM mistakes into the correct primitive instead
+        # of letting them fail and trigger HITL.
+        plan = self._enforce_action_rules(plan)
+
         # Apply deterministic HITL rules — independent of model judgement.
         plan = self._enforce_hitl_rules(plan, retry_count)
+        return plan
+
+    # Known launcher targets — clicking these triggers a file download
+    # whose meta-refresh URL we want to follow. The framework auto-rewrites
+    # plain `click` on these to `click_download_open` so the LLM doesn't
+    # have to remember the right primitive on every run.
+    LAUNCHER_TARGETS = {"loss drafts", "loss draft", "lossdrafts"}
+
+    def _enforce_action_rules(self, plan: ActionPlan) -> ActionPlan:
+        """Deterministic plan rewrites that don't depend on LLM judgement."""
+        if plan.action_type == "click":
+            target_norm = (plan.target or "").lower().strip()
+            if target_norm in self.LAUNCHER_TARGETS:
+                log.info("planner_upgraded_click_to_download_open",
+                         target=plan.target,
+                         reason="known launcher — clicking triggers a download")
+                plan.action_type = "click_download_open"
         return plan
 
     def _enforce_hitl_rules(self, plan: ActionPlan, retry_count: int) -> ActionPlan:

@@ -560,14 +560,25 @@ _RUNTIME_HTML = """<!doctype html>
     </div>
     <div class="row two-col">
       <div>
-        <label>Corrected target name (optional)</label>
+        <label title="Names the element the agent should target. Required if you want a deterministic override.">
+          Corrected target name (optional)
+        </label>
         <input id="g-target" type="text" placeholder="e.g. login_username">
       </div>
       <div>
-        <label>Verified selector (optional)</label>
-        <input id="g-selector" type="text"
-               placeholder='e.g. [data-testid="login-username"]'>
+        <label title="The literal value to type into the target. ONLY effective when combined with a corrected target.">
+          Value to type (optional)
+        </label>
+        <input id="g-value" type="text"
+               placeholder="e.g. vsonawane001  — typed verbatim">
       </div>
+    </div>
+    <div class="row">
+      <label title="Playwright selector. Saved to memory if you tick the save checkbox.">
+        Verified selector (optional)
+      </label>
+      <input id="g-selector" type="text"
+             placeholder='e.g. [data-testid="login-username"]'>
     </div>
     <div class="row checkboxes">
       <label><input type="checkbox" id="g-save-memory">
@@ -783,11 +794,12 @@ async function submitGuidance() {
   if (!agentId || !hitlId) return;
   const instruction = $('#g-instruction').value.trim();
   const target = $('#g-target').value.trim();
+  const value = ($('#g-value') ? $('#g-value').value : '');
   const selector = $('#g-selector').value.trim();
   const saveMem = $('#g-save-memory').checked;
   const saveSop = $('#g-save-sop').checked;
-  if (!instruction && !target && !selector) {
-    alert('Please fill in at least the instruction, target, or selector.');
+  if (!instruction && !target && !selector && !value) {
+    alert('Please fill in at least one of: instruction, target, value, or selector.');
     return;
   }
   let action = 'retry_with_hint';
@@ -804,6 +816,7 @@ async function submitGuidance() {
         body: JSON.stringify({
           action, instruction,
           corrected_target: target || null,
+          corrected_value: value !== '' ? value : null,
           selector_hint: selector || null,
           save_to_memory: saveMem,
           save_to_sop: saveSop,
@@ -814,6 +827,7 @@ async function submitGuidance() {
       $('#hitl-panel').classList.remove('visible');
       $('#g-instruction').value = '';
       $('#g-target').value = '';
+      if ($('#g-value')) $('#g-value').value = '';
       $('#g-selector').value = '';
       $('#g-save-memory').checked = false;
       $('#g-save-sop').checked = false;

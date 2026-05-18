@@ -20,6 +20,14 @@ ActionType = Literal[
     # Loop control — the LLM emits this when it believes the task goal
     # has been satisfied. The loop exits cleanly with status=success.
     "task_complete",
+    # Workflow control — advances WorkingMemory.current_stage without
+    # exiting the task. Used to drive multi-stage SOP-driven flows.
+    "stage_complete",
+    # Click a link/button whose action triggers a file download, capture
+    # the download, and (if it's an HTML launcher with a meta-refresh URL)
+    # navigate the current tab to that URL. Used for RDWeb-style "launch
+    # app via HTML launcher" patterns (e.g. clicking the Loss Drafts tile).
+    "click_download_open",
 ]
 
 ExecutorScope = Literal["browser", "desktop", "rdp", "file", "tool", "auto"]

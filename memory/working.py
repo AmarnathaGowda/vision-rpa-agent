@@ -23,6 +23,12 @@ class WorkingMemory:
     hitl_pending: bool = False
     task_complete: bool = False
     exit_reason: str = ""
+    # Workflow-stage tracker (string id matches the SOP file basename
+    # without prefix, e.g. "login", "document_management"). Used by the
+    # planner to retrieve the right stage SOP and surface progress in
+    # the runtime UI. Empty when the task has no declared stages.
+    current_stage: str = ""
+    stages_completed: list = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {k: v for k, v in self.__dict__.items()

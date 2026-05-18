@@ -19,13 +19,14 @@ log = get_logger(__name__)
 # action_type → "browser" | "desktop" | "rdp" | "file" | "noop"
 ROUTING_TABLE: dict[str, str] = {
     # Generic browser primitives (default scope)
-    "navigate": "browser",
-    "click":    "browser",
-    "type":     "browser",
-    "read":     "browser",
-    "extract":  "browser",
-    "wait":     "browser",
-    "js_eval":  "browser",
+    "navigate":            "browser",
+    "click":               "browser",
+    "type":                "browser",
+    "read":                "browser",
+    "extract":             "browser",
+    "wait":                "browser",
+    "js_eval":             "browser",
+    "click_download_open": "browser",
     # Desktop-only
     "select_option": "desktop",
     # File Explorer / network share / extraction
@@ -38,9 +39,10 @@ ROUTING_TABLE: dict[str, str] = {
     "rdp_reconnect":  "rdp",
     "rdp_disconnect": "rdp",
     # No-op (loop handles these as exits/flags, not executor dispatches)
-    "flag_human":    "noop",
-    "noop":          "noop",
-    "task_complete": "noop",
+    "flag_human":     "noop",
+    "noop":           "noop",
+    "task_complete":  "noop",
+    "stage_complete": "noop",
 }
 
 

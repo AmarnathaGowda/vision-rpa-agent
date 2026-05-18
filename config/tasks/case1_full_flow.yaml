@@ -1,0 +1,88 @@
+# Case 1 — Already Closed Status — full SOP-driven E2E.
+#
+# Mirrors the legacy demo at:
+#   legacy/automation/demo/run_case1_e2e_demo.py
+# 9 stages, all browser-only. No RDP, no desktop attach (Case 3 has those).
+#
+# Run:
+#   poetry run python run_agent.py --task config/tasks/case1_full_flow.yaml
+#
+# Pre-requisites:
+#   1. Simulation server on :8000 (legacy/simulation)
+#   2. .env has RDWEB_USERNAME / RDWEB_PASSWORD
+#   3. SOPs ingested:
+#        poetry run python -m memory.ingest_sop docs/sop/
+#   4. RUNTIME_MODE=demo + LLM_PROVIDER=openai for reasonable latency.
+
+task_id: case1_full_flow
+task_type: case1
+app: browser
+
+# The goal is multi-stage. The planner reads current_stage from working
+# memory and retrieves the matching SOP. It emits stage_complete with
+# target=<next_stage> to advance. Final stage emits task_complete.
+goal: |
+  Execute the Case 1 (Already Closed) workflow end-to-end against the
+  local simulation. ALWAYS START by navigating to
+  http://localhost:8000/rdweb/pages/en-US/login.aspx — that is the
+  application entry point. The task progresses through SEVEN stages —
+  each has its own SOP retrieved automatically based on current_stage:
+
+    1. login                       → RD Web login + Production folder
+                                     SOP: sim-rdweb-login.md
+                                     Exit: URL contains /Default.aspx/Production
+                                     Then emit: stage_complete target=loss_drafts_launch
+
+    2. loss_drafts_launch          → Click Loss Drafts tile → SSO → /lossdrafts/
+                                     SOP: case1-loss-drafts-launch.md
+                                     Exit: URL contains /lossdrafts/
+                                     Then emit: stage_complete target=document_management
+
+    3. document_management         → Open Doc Mgmt tab, select Case 1 row,
+                                     click Link icon, capture PDF URL
+                                     SOP: case1-document-management.md
+                                     Exit: pdf_url set in working memory
+                                     Then emit: stage_complete target=pdf_extraction
+
+    4. pdf_extraction              → Run extract_pdf on the captured URL
+                                     SOP: case1-pdf-extraction.md
+                                     Exit: candidates list non-empty
+                                     Then emit: stage_complete target=claim_validation
+
+    5. claim_validation            → For each candidate: search + record found/not
+                                     SOP: case1-claim-validation.md
+                                     Exit: validations list complete
+                                     Then emit: stage_complete target=cross_verify
+
+    6. cross_verify                → loan_db_lookup + identity comparison
+                                     SOP: case1-cross-verify.md
+                                     Exit: pdf_identity + system_identity set
+                                     Then emit: stage_complete target=case1_evaluate
+
+    7. case1_evaluate              → Run Case1Handler.evaluate(extraction)
+                                     SOP: case1-already-closed-rule.md
+                                     Exit: case1_result populated
+                                     Then emit: task_complete
+
+  At each stage, retrieve the matching SOP and follow its Steps and Done-when
+  exactly. Do NOT skip stages. Do NOT emit task_complete until case1_result
+  is in working memory.
+
+  Credentials are available via {{RDWEB_USERNAME}} and {{RDWEB_PASSWORD}}.
+
+# Initial stage when the task starts.
+initial_stage: login
+
+# Deterministic completion gate — the loop only treats task_complete as
+# success when every key in done_when.all_set is present in
+# working.extracted_values. If the LLM emits task_complete early, the
+# guard re-routes to HITL with an explanation.
+done_when:
+  all_set:
+    - rdweb_authenticated   # set in stage 1
+    - lossdrafts_loaded     # set in stage 2
+    - pdf_url               # set in stage 3
+    - candidates            # set in stage 4
+    - validations           # set in stage 5
+    - pdf_identity          # set in stage 6
+    - case1_result          # set in stage 7

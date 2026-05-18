@@ -60,6 +60,10 @@ class StubExecutor:
 class AgentLoop:
     RETRY_LIMIT = 3
     DUPLICATE_PLAN_THRESHOLD = 2  # 2 consecutive identical plans → HITL
+    # Premature task_complete attempts before escalating to HITL. The
+    # framework auto-injects corrective guidance for up to this many
+    # attempts before asking a human.
+    MAX_PREMATURE_COMPLETIONS = 3
 
     def __init__(
         self,
@@ -115,10 +119,78 @@ class AgentLoop:
 
             plan = self._reason(screen)
 
+            # ── Stage-complete signal ────────────────────────────────
+            # The LLM declares the current workflow stage's exit criteria
+            # met. Advance current_stage to plan.target (the next stage id)
+            # without exiting the task. Lets the next iteration retrieve
+            # the next stage's SOP and continue.
+            if plan.action_type == "stage_complete":
+                old_stage = self.working.current_stage
+                next_stage = plan.target or ""
+                if old_stage and old_stage not in self.working.stages_completed:
+                    self.working.stages_completed.append(old_stage)
+                self.working.current_stage = next_stage
+                log.info("stage_complete",
+                         task_id=self.working.task_id,
+                         from_stage=old_stage,
+                         to_stage=next_stage,
+                         reason=plan.reason or "(no reason given)")
+                self.audit.append("stage_complete",
+                                  task_id=self.working.task_id,
+                                  step=self.working.step,
+                                  from_stage=old_stage,
+                                  to_stage=next_stage)
+                self._store(plan, ActionResult(status="ok",
+                                               extracted_value=next_stage,
+                                               duration_ms=0), screen)
+                continue
+
             # ── Task-complete signal ─────────────────────────────────
             # The LLM declares the goal satisfied. Persist the decision
             # and exit the loop cleanly on the next iteration.
             if plan.action_type == "task_complete":
+                # Deterministic completion gate — if the task YAML
+                # declares `done_when.all_set`, every named key MUST be
+                # in extracted_values before we accept task_complete.
+                missing = self._missing_completion_keys()
+                if missing:
+                    # First N premature task_complete attempts: auto-inject
+                    # corrective guidance and let the planner re-reason.
+                    # The framework already knows what's missing — no need
+                    # to bounce to HITL on every attempt. After
+                    # MAX_PREMATURE_COMPLETIONS, escalate to a human.
+                    counter_key = "premature_task_complete_count"
+                    n = int(self.working.extracted_values.get(counter_key, 0)) + 1
+                    self.working.extracted_values[counter_key] = n
+                    log.warning("task_complete_rejected_missing_keys",
+                                task_id=self.working.task_id,
+                                missing=missing,
+                                attempt=n)
+                    if n <= self.MAX_PREMATURE_COMPLETIONS:
+                        self._inject_completion_guidance(missing)
+                        # Replan immediately on the next iteration with the
+                        # new guidance — no HITL, no human-in-the-loop.
+                        self._store(plan, ActionResult(
+                            status="deferred",
+                            error_msg=f"task_complete_premature (auto-correct attempt {n})"),
+                            screen)
+                        continue
+                    # Escalate to HITL after repeated failures — the LLM is
+                    # genuinely stuck and a human needs to intervene.
+                    self._route_to_hitl(
+                        plan, screen,
+                        explicit_reason=(
+                            f"The agent has tried to declare the task complete "
+                            f"{n} times without filling the required fields: "
+                            f"{missing}. The auto-correction loop didn't help. "
+                            f"Please give a specific next action (e.g. "
+                            f"corrected_target='Loss Drafts')."
+                        ),
+                    )
+                    self._store(plan, ActionResult(status="deferred",
+                                                   error_msg="task_complete_premature"),
+                                screen)
+                    continue
                 log.info("task_complete_declared",
                          task_id=self.working.task_id,
                          step=self.working.step,
@@ -157,6 +229,55 @@ class AgentLoop:
                 continue
 
             result = self._act(plan)
+
+            # Wrong-element-for-type — the LLM targeted a button/link/label
+            # for a `type` action. First N attempts: auto-inject guidance
+            # telling the LLM exactly what went wrong; let it re-plan.
+            # Escalate to HITL only after the auto-correct stops working.
+            if result.status == "failed" and result.error_msg.startswith(
+                "wrong_element_for_type:"
+            ):
+                counter_key = "wrong_element_count"
+                n = int(self.working.extracted_values.get(counter_key, 0)) + 1
+                self.working.extracted_values[counter_key] = n
+                if n <= self.MAX_PREMATURE_COMPLETIONS:
+                    log.warning("wrong_element_auto_correct",
+                                target=plan.target, attempt=n)
+                    self.working.extracted_values["human_guidance"] = {
+                        "instruction": (
+                            f"Your previous plan emitted action_type='type' "
+                            f"with target={plan.target!r}, but the framework "
+                            f"refused: that element is NOT an <input>. It "
+                            f"resolved to a button/heading/label.\n\n"
+                            f"Look at visible_elements and pick the entry "
+                            f"whose `type` is 'field' (not 'button'). "
+                            f"On a login form, the input fields usually have "
+                            f"placeholders or labels like 'Username', "
+                            f"'Password', 'Domain\\user name', etc.\n\n"
+                            f"If you intended to SUBMIT the form, the "
+                            f"correct action_type is 'click', not 'type'."
+                        ),
+                        "corrected_target": None,
+                        "selector_hint": None,
+                        "save_to_memory": False,
+                        "save_to_sop": False,
+                        "confidence": 1.0,
+                        "created_by": "framework_auto_correct",
+                    }
+                    self._store(plan, result, screen)
+                    continue
+                self._route_to_hitl(
+                    plan, screen,
+                    explicit_reason=(
+                        f"The agent tried to type into the wrong element "
+                        f"(target={plan.target!r}) {n} times — auto-correct "
+                        f"didn't help. Please provide a corrected_target "
+                        f"(e.g. 'Password', 'login_password') and tick "
+                        f"'Save this correction' so future runs cache it."
+                    ),
+                )
+                self._store(plan, result, screen)
+                continue
 
             # Unresolved credential placeholders short-circuit to HITL — no
             # amount of retrying will produce a value the framework doesn't
@@ -228,7 +349,16 @@ class AgentLoop:
                 requires_hitl=True,
                 confidence=0.0,
             )
-            self._route_to_hitl(hitl_plan, screen)
+            # Forward the directive's reason so _route_to_hitl can describe
+            # the cause accurately instead of falling through to the
+            # "no identifiable cause (bug)" branch.
+            explicit_reason = directive.reason or None
+            if failed_result and failed_result.error_msg:
+                explicit_reason = (explicit_reason or "") + (
+                    f"\nLast error: {failed_result.error_msg}"
+                )
+            self._route_to_hitl(hitl_plan, screen,
+                                  explicit_reason=explicit_reason)
             self._store(hitl_plan,
                         ActionResult(status="deferred", error_msg=directive.reason),
                         screen)
@@ -296,6 +426,7 @@ class AgentLoop:
             task_type=task_type,
             goal=goal,
             agent_id=self.agent_id,
+            current_stage=task.get("initial_stage") or "",
         )
         self.session.start_task(task_id=task_id, task_type=task_type, goal=goal,
                                 agent_id=self.agent_id)
@@ -540,6 +671,54 @@ class AgentLoop:
                           step=self.working.step,
                           hitl_id=hitl_id,
                           reason=reason)
+
+    # ── Completion gate ──────────────────────────────────────────────────
+    def _inject_completion_guidance(self, missing: list[str]) -> None:
+        """When the LLM emits task_complete prematurely, push the gate's
+        feedback into working memory as ``human_guidance``. The planner's
+        existing guidance-context helper will surface it as a priority
+        system message on the next iteration — no HITL, no human prompt."""
+        assert self.working is not None and self.task_goal is not None
+        current_stage = self.working.current_stage or "(unknown)"
+        stages_done = self.working.stages_completed or []
+        # First missing key → most likely the next stage to work on.
+        next_missing = missing[0] if missing else ""
+        instruction = (
+            f"You just emitted action_type=task_complete, but the workflow "
+            f"is NOT done. Missing required fields: {missing}.\n\n"
+            f"CURRENT STAGE: {current_stage}\n"
+            f"COMPLETED STAGES: {stages_done or '(none yet)'}\n\n"
+            f"Re-plan the NEXT concrete action that progresses the workflow. "
+            f"You probably need to interact with the page (click a tile, "
+            f"navigate, open a menu) — not declare completion. "
+            f"If the current stage's exit criteria are met, emit "
+            f"action_type='stage_complete' with target=<next stage name>. "
+            f"Only emit task_complete after the FINAL stage."
+        )
+        self.working.extracted_values["human_guidance"] = {
+            "instruction": instruction,
+            "corrected_target": None,
+            "selector_hint": None,
+            "save_to_memory": False,
+            "save_to_sop": False,
+            "confidence": 1.0,
+            "created_by": "framework_auto_correct",
+        }
+        log.info("completion_guidance_injected",
+                 task_id=self.working.task_id,
+                 missing=missing,
+                 current_stage=current_stage)
+
+    def _missing_completion_keys(self) -> list[str]:
+        """Return the subset of ``done_when.all_set`` keys NOT yet in
+        ``working.extracted_values``. Empty list = ready to declare done."""
+        assert self.task_goal is not None and self.working is not None
+        done_when = (self.task_goal.raw or {}).get("done_when") or {}
+        required = done_when.get("all_set") or []
+        if not required:
+            return []
+        ev = self.working.extracted_values or {}
+        return [k for k in required if k not in ev or ev[k] in (None, "", [])]
 
     # ── duplicate-plan guardrail helpers ─────────────────────────────────
     def _is_repeated_plan(self, plan: ActionPlan) -> bool:
