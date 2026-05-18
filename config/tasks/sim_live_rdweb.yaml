@@ -1,17 +1,32 @@
-# VLM-driven sim run against the local RD Web login page.
+# Sim live: complete RD Web login and land on the RemoteApps Production
+# workspace. Exercises the full observe → reason → act → store loop with
+# the credentials substitution + HITL approval gate + task-complete signal.
 #
-# Tests browser perception against an ASPX form. The agent should recognise
-# the username + password fields and the sign-in button. HITL pause is
-# EXPECTED on the password field — credentials are never auto-filled by
-# the agent without a human approval gate on the first 10 runs
-# (CLAUDE.md non-negotiable).
+# Expected flow:
+#   1. navigate to login.aspx (guardrail)
+#   2. type {{RDWEB_USERNAME}} into the username field
+#   3. type {{RDWEB_PASSWORD}} into the password field
+#   4. flag_human → "Sign in"  (CLAUDE.md: write actions need human
+#      approval for the first 10 runs of a new task type)
+#   5. operator approves → framework converts flag_human into click → Sign in
+#   6. perception confirms post-login landing page
+#   7. agent emits action_type=task_complete → loop exits status=success
+#
+# This task is the FIRST leg of every case (1/2/3/4) — Case 1 evaluation
+# itself runs through config/tasks/case1_already_closed.yaml.
 
 task_id: sim_live_rdweb_login
 task_type: case1
 app: browser
 goal: |
-  Open http://localhost:8000/rdweb/pages/en-US/login.aspx in the current
-  browser tab. Identify the username field, password field, and the sign-in
-  button. Type the username 'automation_user' into the username field, then
-  STOP and flag for human approval before typing the password or clicking
-  sign in. Do not submit the form.
+  Log in to the RD Web Access portal at
+  http://localhost:8000/rdweb/pages/en-US/login.aspx using the credentials
+  available as the {{RDWEB_USERNAME}} and {{RDWEB_PASSWORD}} placeholders.
+  Fill both fields, then flag for human approval BEFORE clicking the
+  Sign-in button (this is the irreversible write step). After the operator
+  approves and the page transitions to the RemoteApps landing page
+  (shows the "RemoteApp and Desktops" header with Production and Testing
+  folders, or the Production folder contents), declare the task complete
+  by emitting action_type "task_complete" with a short reason citing the
+  visible landing page. Do NOT click any RemoteApp tile after login —
+  that's a separate task.

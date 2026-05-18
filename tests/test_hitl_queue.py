@@ -99,6 +99,24 @@ def test_apply_resolution_skip_advances(session_store):
     assert w.hitl_pending is False
 
 
+def test_apply_resolution_retry_with_values_merges_and_clears_retries(session_store):
+    """retry_with_values: merge extracted_values, clear retry counts, DO NOT advance."""
+    q = HITLQueue(session=session_store)
+    w = _make_working(step=2)
+    w.extracted_values = {"existing": "v"}
+    q.apply_resolution(
+        {"action": "retry_with_values",
+         "extracted_values": {"RDWEB_PASSWORD": "Welcome@123"}},
+        w,
+    )
+    assert w.hitl_pending is False
+    assert w.step == 2  # not advanced
+    assert w.extracted_values == {"existing": "v", "RDWEB_PASSWORD": "Welcome@123"}
+    # Retry counters for the step cleared so executor gets a fresh attempt.
+    assert "2" not in w.retry_counts
+    assert "recovery_2" not in w.retry_counts
+
+
 def test_apply_resolution_abort_terminates(session_store):
     q = HITLQueue(session=session_store)
     w = _make_working(step=2)

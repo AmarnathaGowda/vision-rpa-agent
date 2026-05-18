@@ -17,9 +17,12 @@ ActionType = Literal[
     "file_navigate", "file_open", "extract_pdf", "read_excel",
     # RDP lifecycle
     "rdp_launch", "rdp_disconnect", "rdp_reconnect",
+    # Loop control — the LLM emits this when it believes the task goal
+    # has been satisfied. The loop exits cleanly with status=success.
+    "task_complete",
 ]
 
-ExecutorScope = Literal["browser", "desktop", "rdp", "file", "auto"]
+ExecutorScope = Literal["browser", "desktop", "rdp", "file", "tool", "auto"]
 
 
 class VisibleElement(BaseModel):

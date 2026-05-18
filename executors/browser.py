@@ -5,6 +5,8 @@ returns an ActionResult. Page/context lifecycle is managed by BrowserSession.
 """
 from __future__ import annotations
 
+import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +18,64 @@ from agent.schemas import ActionPlan, ActionResult
 from config.logging_config import get_logger
 from config.settings import settings
 from executors.selectors import SelectorResolutionError, SelectorResolver
+
+
+# Recognises both {{KEY}} and {KEY} forms (the LLM frequently picks one
+# brace despite the prompt). Both `{{settings.KEY}}` / `{{working.KEY}}`
+# variants are also accepted. The single-brace variant requires
+# all-uppercase keys to reduce the false-positive rate (we don't want to
+# accidentally match a literal `{path}` template in a CSS selector).
+_TEMPLATE_RE = re.compile(
+    r"""
+    \{\{\s*(?:settings\.|working\.)?([A-Za-z_][A-Za-z0-9_]*)\s*\}\}  # {{KEY}}
+    |
+    \{\s*([A-Z][A-Z0-9_]+)\s*\}                                       # {KEY}
+    """,
+    re.VERBOSE,
+)
+
+
+def _resolve_templates(value: str, *, working: dict | None = None) -> tuple[str, list[str]]:
+    """Substitute ``{{KEY}}`` placeholders from settings / working memory / env.
+
+    Lookup order for each key (case-insensitive in settings, exact in working):
+      1. ``working[key]`` if a working-memory dict was provided
+      2. ``settings.<key.lower()>``
+      3. ``os.environ[key.upper()]``
+    Returns (resolved_string, list_of_unresolved_keys).
+    """
+    if not value or "{" not in value:
+        return value, []
+
+    unresolved: list[str] = []
+
+    def _sub(m: re.Match) -> str:
+        # Either group 1 ({{KEY}}) or group 2 ({KEY}) will be set.
+        key = m.group(1) or m.group(2)
+        # working memory first
+        if working and key in working and working[key] not in (None, ""):
+            return str(working[key])
+        # settings
+        v = getattr(settings, key.lower(), None)
+        if v not in (None, ""):
+            return str(v)
+        # env vars (uppercase)
+        env_v = os.environ.get(key.upper())
+        if env_v:
+            return env_v
+        unresolved.append(key)
+        return m.group(0)  # leave the placeholder so HITL can flag it
+
+    resolved = _TEMPLATE_RE.sub(_sub, value)
+    return resolved, unresolved
+
+
+class UnresolvedCredentialError(RuntimeError):
+    """Raised when a {{KEY}} placeholder can't be resolved — the loop catches
+    this and routes to HITL with a credential-input prompt."""
+    def __init__(self, keys: list[str]):
+        super().__init__(f"unresolved credentials: {keys}")
+        self.keys = keys
 
 if TYPE_CHECKING:
     from playwright.sync_api import Browser, BrowserContext, Page
@@ -96,6 +156,10 @@ class BrowserExecutor:
         self.resolver = resolver or SelectorResolver()
         self.screenshot_dir = Path(screenshot_dir or settings.screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        # AgentLoop assigns a working-memory view here before each act so
+        # _resolve_templates can pick up operator-provided values (e.g. a
+        # password just entered via HITL credential prompt).
+        self._working_view: dict | None = None
 
     # ── ActionRouter contract ───────────────────────────────────────────────
     def execute(self, plan: ActionPlan) -> ActionResult:
@@ -115,6 +179,13 @@ class BrowserExecutor:
                 error_msg=f"selector_unresolved: {e}",
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
+        except UnresolvedCredentialError as e:
+            log.warning("credential_unresolved", target=plan.target, keys=e.keys)
+            return ActionResult(
+                status="failed",
+                error_msg=f"unresolved_credentials: {', '.join(e.keys)}",
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
         except Exception as e:  # noqa: BLE001 — last-line safety net
             log.exception("browser_action_failed", action=plan.action_type, target=plan.target)
             return ActionResult(
@@ -126,14 +197,24 @@ class BrowserExecutor:
     # ── primitives ──────────────────────────────────────────────────────────
     def _dispatch(self, plan: ActionPlan) -> tuple[str, str]:
         """Return (extracted_value, screenshot_path)."""
+        # Resolve {{KEY}} placeholders in `value` (credentials, URLs, etc.)
+        # before any actual action. Unresolved keys raise — the loop catches
+        # this and routes to HITL with a credential-input panel.
+        raw_value = plan.value or ""
+        resolved_value, unresolved = _resolve_templates(
+            raw_value, working=getattr(self, "_working_view", None),
+        )
+        if unresolved:
+            raise UnresolvedCredentialError(unresolved)
+
         if plan.action_type == "navigate":
-            self.navigate(plan.value or plan.target)
+            self.navigate(resolved_value or plan.target)
             return "", self._snap(plan)
         if plan.action_type == "click":
             self.click(plan.target, fallback=plan.fallback)
             return "", self._snap(plan)
         if plan.action_type == "type":
-            self.fill(plan.target, plan.value, fallback=plan.fallback)
+            self.fill(plan.target, resolved_value, fallback=plan.fallback)
             return "", self._snap(plan)
         if plan.action_type in ("read", "extract"):
             value = self.read_text(plan.target, fallback=plan.fallback)

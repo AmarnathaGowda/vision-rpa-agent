@@ -15,7 +15,9 @@ def test_preprocess_converts_to_rgb():
     assert out.mode == "RGB"
 
 
-def test_preprocess_downscales_large_image():
+def test_preprocess_downscales_large_image(monkeypatch):
+    # Force lightweight off so we test the default cap, independent of .env.
+    monkeypatch.setattr("config.settings.settings.lightweight_mode", False)
     img = Image.new("RGB", (4000, 2000))
     p = PerceptionLayer(client=MockOpenAIClient())
     out = p.preprocess(img)

@@ -7,6 +7,10 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        # Don't crash on unknown env vars — the host machine often has
+        # unrelated keys in .env (legacy / sibling project / shell-exported).
+        # Declared fields above are still strictly typed.
+        extra="ignore",
     )
 
     # ── Runtime mode ──────────────────────────────────────────────────
@@ -68,6 +72,14 @@ class Settings(BaseSettings):
     rdweb_username: str = ""
     rdweb_password: str = ""
     rdp_keepalive_seconds: int = 240
+
+    # Simulation credentials (mirror legacy/simulation/data/users.json).
+    # Legacy code reads these via fixtures.credentials.rdweb_credentials();
+    # the new framework reads RDWEB_USERNAME / RDWEB_PASSWORD above.
+    sim_username: str = ""
+    sim_password: str = ""
+    sso_username: str = ""
+    sso_password: str = ""
 
     # Agent behaviour
     agent_id: str = "agent_01"

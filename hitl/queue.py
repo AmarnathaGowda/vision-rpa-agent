@@ -1,27 +1,87 @@
 """HITL queue — pause agent, write review request, poll for human resolution.
 
-Phase 5 contract:
+HumanGuidance — the operator's instruction payload (see ``apply_resolution``).
+The planner reads it from working memory and prioritises it over its own
+inferred plan. Persisted to ``ui_patterns`` / ``sop_chunks`` knowledge
+collections when ``save_to_memory`` / ``save_to_sop`` are set.
 
-1. ``flag()``     — write a pending review to ``hitl_queue`` via SessionMemory.
-                    The AgentLoop already does this in ``_route_to_hitl``; this
-                    method is exposed for callers that want to raise a review
-                    outside the loop (e.g. recovery directives, executors).
-2. ``wait_for_resolution()`` — block (polling SQLite) until a human resolves
-                    the review or the configured timeout elapses. Safe to call
-                    from any thread; uses ``time.sleep`` between polls.
-3. ``apply_resolution()`` — mutate the in-memory ``WorkingMemory`` so the
-                    AgentLoop can ``resume()`` cleanly. Resolution shape:
-
-        {"action": "approve" | "correct" | "skip" | "abort",
-         "corrected_plan": {...optional ActionPlan fields...},
-         "extracted_values": {...optional field overrides...},
-         "note": "...",
-         "resolver": "human_user"}
-
-The HITLQueue never touches the loop directly — orchestration lives in the
-runner / supervisor (see ``hitl/runner.py``).
+HITLQueue contract:
+  1. flag()                  — write a pending review.
+  2. wait_for_resolution()   — block (poll) until resolved.
+  3. apply_resolution()      — mutate WorkingMemory so the loop can resume.
+Orchestration lives in hitl/runner.py.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+# ── Safety: regex patterns that must NOT appear in operator instructions ──
+# Operator hints become a system message in the planner prompt and may
+# influence selector strings. We block obvious shell / JS injection
+# patterns; the planner's action_type allowlist is the durable safety net.
+_DANGEROUS_PATTERNS = [
+    "<script", "</script>", "javascript:", "data:text/html",
+    "eval(", "Function(", "subprocess", "os.system",
+    "rm -rf", "; rm ", "| rm ", "$(", "`",
+]
+
+
+def _scrub_instruction(text: str) -> str:
+    """Return ``text`` with dangerous fragments removed and length capped."""
+    if not text:
+        return ""
+    s = str(text)
+    for pat in _DANGEROUS_PATTERNS:
+        s = s.replace(pat, "[REDACTED]")
+    return s[:2000]
+
+
+@dataclass
+class HumanGuidance:
+    """One operator's correction for one HITL review.
+
+    Attached to ``working_memory.extracted_values["human_guidance"]`` so the
+    planner can read it on the next iteration. The dataclass shape is the
+    contract between the UI submission, the queue, and the planner.
+    """
+    instruction: str = ""
+    corrected_target: str | None = None    # e.g. "Domain\\user name"
+    selector_hint: str | None = None       # e.g. "[data-testid='login-username']"
+    save_to_memory: bool = False           # → ui_patterns collection
+    save_to_sop: bool = False              # → sop_chunks collection
+    confidence: float = 0.9
+    created_by: str = "floating-ui"
+
+    def to_dict(self) -> dict:
+        return {
+            "instruction": _scrub_instruction(self.instruction),
+            "corrected_target": self.corrected_target,
+            "selector_hint": self.selector_hint,
+            "save_to_memory": bool(self.save_to_memory),
+            "save_to_sop": bool(self.save_to_sop),
+            "confidence": float(self.confidence),
+            "created_by": self.created_by,
+        }
+
+    @classmethod
+    def from_resolution(cls, resolution: dict) -> "HumanGuidance | None":
+        """Extract a HumanGuidance from a resolution dict if guidance fields
+        are present. Returns None for control-only resolutions."""
+        keys = ("instruction", "corrected_target", "selector_hint",
+                "save_to_memory", "save_to_sop")
+        if not any(resolution.get(k) for k in keys):
+            return None
+        return cls(
+            instruction=resolution.get("instruction", "") or "",
+            corrected_target=resolution.get("corrected_target") or None,
+            selector_hint=resolution.get("selector_hint") or None,
+            save_to_memory=bool(resolution.get("save_to_memory", False)),
+            save_to_sop=bool(resolution.get("save_to_sop", False)),
+            confidence=float(resolution.get("confidence", 0.9)),
+            created_by=resolution.get("resolver", "floating-ui"),
+        )
+
 
 import time
 from typing import Any
@@ -46,10 +106,22 @@ class HITLQueue:
         session: SessionMemory,
         poll_interval_s: float | None = None,
         timeout_minutes: int | None = None,
+        knowledge: Any | None = None,
     ) -> None:
         self.session = session
         self.poll_interval_s = poll_interval_s if poll_interval_s is not None else self.DEFAULT_POLL_INTERVAL_S
         self.timeout_minutes = timeout_minutes if timeout_minutes is not None else settings.hitl_timeout_minutes
+        # KnowledgeStore — optional. When supplied, save_to_memory and
+        # save_to_sop flags in operator guidance write the correction to
+        # ui_patterns / sop_chunks for cross-session reuse.
+        self._knowledge = knowledge
+
+    @property
+    def knowledge(self):
+        if self._knowledge is None:
+            from memory.knowledge import get_knowledge_store
+            self._knowledge = get_knowledge_store()
+        return self._knowledge
 
     # ── enqueue ───────────────────────────────────────────────────────────
     def flag(
@@ -107,6 +179,129 @@ class HITLQueue:
                 yield_call()
             sleep(self.poll_interval_s)
 
+    def _persist_guidance_to_knowledge(
+        self, guidance: HumanGuidance, working: WorkingMemory,
+    ) -> None:
+        """Persist operator corrections to the org-wide knowledge store.
+
+        ui_patterns      — corrected_target + selector_hint pairs (so future
+                           runs can resolve the same target via cache).
+        sop_chunks       — full guidance text as a new SOP chunk (so the
+                           planner can retrieve it next time it sees a
+                           similar screen/goal).
+
+        Best-effort: never raises into the caller.
+        """
+        try:
+            store = self.knowledge
+        except Exception as e:  # noqa: BLE001
+            log.warning("knowledge_unavailable", error=str(e))
+            return
+
+        if guidance.save_to_memory and guidance.corrected_target and guidance.selector_hint:
+            try:
+                store.store_ui_pattern(
+                    app=working.current_app or "browser",
+                    element_desc=guidance.corrected_target,
+                    selector=guidance.selector_hint,
+                    action_type="hitl_taught",
+                )
+                # ui_patterns are buffered — flush so the next planner run sees it.
+                if hasattr(store, "flush"):
+                    store.flush()
+                log.info("hitl_guidance_saved_to_memory",
+                         target=guidance.corrected_target,
+                         selector=guidance.selector_hint)
+            except Exception as e:  # noqa: BLE001
+                log.warning("hitl_save_to_memory_failed", error=str(e))
+
+        if guidance.save_to_sop and (guidance.instruction or guidance.corrected_target):
+            try:
+                from memory.sop_loader import SOPChunk
+                import hashlib
+
+                body_parts = []
+                if guidance.instruction:
+                    body_parts.append(f"Operator instruction:\n{guidance.instruction}")
+                if guidance.corrected_target:
+                    body_parts.append(
+                        f"Correct target name: {guidance.corrected_target}"
+                    )
+                if guidance.selector_hint:
+                    body_parts.append(
+                        f"Verified selector: {guidance.selector_hint}"
+                    )
+                text = (
+                    f"# HITL-taught correction (task: {working.task_id})\n\n"
+                    + "\n\n".join(body_parts)
+                )
+                cid = hashlib.sha256(text.encode()).hexdigest()[:32]
+                chunk = SOPChunk(
+                    id=f"hitl_{cid}",
+                    text=text,
+                    metadata={
+                        "source": f"hitl/{working.task_id}",
+                        "kind": "hitl_correction",
+                        "created_by": guidance.created_by,
+                    },
+                )
+                store.upsert_sop_chunks([chunk])
+                log.info("hitl_guidance_saved_to_sop", chunk_id=chunk.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("hitl_save_to_sop_failed", error=str(e))
+
+    # ── Flag-human-approval semantics ──────────────────────────────────
+    _PROCEED_VERBS = (
+        "proceed", "continue", "go ahead", "approve", "yes",
+        "ok", "okay", "do it", "execute", "submit", "click",
+    )
+
+    @classmethod
+    def _is_proceed_instruction(cls, text: str | None) -> bool:
+        if not text:
+            return False
+        t = text.strip().lower()
+        if not t:
+            return False
+        # Very short messages → check whole phrase. Longer → check tokens.
+        return any(verb in t for verb in cls._PROCEED_VERBS)
+
+    @staticmethod
+    def _maybe_set_flag_human_override(working: WorkingMemory) -> None:
+        """If the most recent plan in decisions_log was ``flag_human``, write
+        a one-shot override into working memory so the next loop iteration
+        executes the *concrete* action that was flagged (typically a click
+        on the named target).
+
+        The agent loop reads ``extracted_values["next_action_override"]``
+        in ``_reason()``, runs it once, and clears it. No LLM call.
+        """
+        for entry in reversed(working.decisions_log):
+            if "action_type" not in entry:
+                continue
+            if entry.get("action_type") == "flag_human":
+                target = entry.get("target") or ""
+                if not target:
+                    return
+                working.extracted_values["next_action_override"] = {
+                    "action_type": "click",
+                    "target": target,
+                    "value": "",
+                    "reason": f"operator-approved execution of flagged action on {target!r}",
+                    "confidence": 1.0,
+                    "requires_hitl": False,
+                    "cache_hit": True,
+                }
+            return  # only check the most recent concrete plan
+
+    @staticmethod
+    def _clear_retry_counters(working: WorkingMemory) -> None:
+        """Drop retry + recovery counters for the current step so the next
+        planning iteration starts fresh."""
+        step_key = str(working.step)
+        working.retry_counts.pop(step_key, None)
+        working.retry_counts.pop(f"recovery_{step_key}", None)
+
     # ── apply ─────────────────────────────────────────────────────────────
     def apply_resolution(
         self,
@@ -125,7 +320,16 @@ class HITLQueue:
         resolution in ``decisions_log`` for the audit trail.
         """
         action = (resolution.get("action") or "").lower()
-        if action not in ("approve", "correct", "skip", "abort"):
+        valid_actions = (
+            "approve", "correct", "skip", "abort",
+            "retry_with_values",
+            # New guidance-bearing actions:
+            "retry_with_hint",   # carries instruction + optional corrected_target
+            "correct_target",    # operator names the real selector/target
+            "teach_selector",    # corrected_target + save_to_memory
+            "save_as_sop",       # capture this correction as an SOP chunk
+        )
+        if action not in valid_actions:
             # Validate BEFORE mutating working memory — otherwise a malformed
             # resolution would clear hitl_pending and silently swallow the
             # review. The runner can then re-poll for a fresh resolution.
@@ -145,11 +349,14 @@ class HITLQueue:
         if action == "approve":
             # Clear retry counters for the current step so the planner can
             # re-attempt it without immediately re-tripping the retry guard.
-            step_key = str(working.step)
-            working.retry_counts.pop(step_key, None)
-            working.retry_counts.pop(f"recovery_{step_key}", None)
+            self._clear_retry_counters(working)
+            # If the loop is paused on a flag_human plan, the operator's
+            # "approve" means "do the thing you flagged" — not "ask me
+            # again". Stash a one-shot override the loop consumes next turn.
+            self._maybe_set_flag_human_override(working)
             log.info("hitl_apply_approve",
-                     task_id=working.task_id, step=working.step)
+                     task_id=working.task_id, step=working.step,
+                     override=bool(working.extracted_values.get("next_action_override")))
             return
 
         if action == "correct":
@@ -167,6 +374,66 @@ class HITLQueue:
             working.step += 1
             log.info("hitl_apply_skip",
                      task_id=working.task_id, step=working.step)
+            return
+
+        # ── Guidance-bearing actions ─────────────────────────────────
+        # All of these stash a HumanGuidance into working memory so the
+        # next planner iteration prioritises it over inferred reasoning.
+        # They do NOT advance the step — the agent re-tries with hints.
+        if action in ("retry_with_hint", "correct_target",
+                       "teach_selector", "save_as_sop"):
+            guidance = HumanGuidance.from_resolution(resolution)
+            if guidance is None:
+                # Caller passed the action verb but no actual guidance —
+                # treat as plain retry.
+                self._clear_retry_counters(working)
+                log.info("hitl_apply_guidance_action_empty",
+                         task_id=working.task_id, action=action)
+                return
+            # save_to_memory / save_to_sop flags trigger knowledge writes
+            # in the runner / planner; the queue's job is to persist the
+            # guidance so downstream layers can act on it.
+            if action == "teach_selector":
+                guidance.save_to_memory = True
+            if action == "save_as_sop":
+                guidance.save_to_sop = True
+            working.extracted_values["human_guidance"] = guidance.to_dict()
+            self._clear_retry_counters(working)
+            # Best-effort knowledge persistence — failures log but never
+            # abort the resume (memory is an enhancement, not a hard dep).
+            self._persist_guidance_to_knowledge(guidance, working)
+            # When guidance has no corrected target / selector but reads
+            # like a "go ahead" instruction (e.g. "please proceed"), and the
+            # paused plan was a flag_human gate, the operator clearly means
+            # "execute the flagged action". Set the same one-shot override.
+            if self._is_proceed_instruction(guidance.instruction) \
+                    and not guidance.corrected_target \
+                    and not guidance.selector_hint:
+                self._maybe_set_flag_human_override(working)
+            log.info("hitl_apply_guidance",
+                     task_id=working.task_id, step=working.step,
+                     action=action,
+                     has_corrected_target=bool(guidance.corrected_target),
+                     has_selector_hint=bool(guidance.selector_hint),
+                     save_to_memory=guidance.save_to_memory,
+                     save_to_sop=guidance.save_to_sop,
+                     override=bool(working.extracted_values.get("next_action_override")))
+            return
+
+        if action == "retry_with_values":
+            # Operator provided missing data (e.g. a credential). Merge into
+            # extracted_values, clear the retry counters for the current
+            # step so the next iteration starts fresh, but DO NOT advance —
+            # we want to retry the same step now that the values are present.
+            overrides = resolution.get("extracted_values") or {}
+            if overrides:
+                working.extracted_values.update(overrides)
+            step_key = str(working.step)
+            working.retry_counts.pop(step_key, None)
+            working.retry_counts.pop(f"recovery_{step_key}", None)
+            log.info("hitl_apply_retry_with_values",
+                     task_id=working.task_id, step=working.step,
+                     fields_overridden=list(overrides.keys()))
             return
 
         if action == "abort":

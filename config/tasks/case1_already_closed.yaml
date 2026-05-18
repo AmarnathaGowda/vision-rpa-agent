@@ -1,0 +1,36 @@
+# Case 1 — Already Closed claim evaluation (parity baseline).
+#
+# This task uses a deterministic step that invokes the legacy Case1Handler
+# as a single tool call. It is the *parity baseline* — proves the legacy
+# logic is reachable from the new framework with identical output.
+#
+# A subsequent task YAML (`case1_already_closed_sop.yaml`, not yet written)
+# will exercise the SOP-driven step-by-step path once the planner can
+# reliably reproduce the same output. Both YAMLs satisfy the same SOP at
+# docs/sop/case1-already-closed-rule.md.
+#
+# Run:
+#   poetry run python run_agent.py --task config/tasks/case1_already_closed.yaml --skip-preflight
+#
+# Fixtures are passed in via working memory at task init — see
+# tests/test_parity_case1.py for the fixture loading pattern. For ad-hoc
+# runs, the `extraction` field below is a minimal stub.
+
+task_id: case1_already_closed
+task_type: case1
+app: tool
+goal: |
+  Evaluate whether the claim referenced in the carrier letter is already
+  closed in the loan database. Apply the header-priority rule, detect
+  closure phrases, and produce a Case1Result.
+
+# Deterministic single-step path — invokes the legacy handler verbatim.
+steps:
+  - action_type: extract
+    target: case1_evaluate
+    app: tool
+    # `value` is a JSON-encoded ExtractionResult dict. For real runs the
+    # parity harness populates this from PDF extraction; the stub below
+    # exercises the "no valid claim" path so the task runs without input.
+    value: '{"raw_text": "stub", "candidates": [], "ocr_used": false}'
+    reason: "invoke legacy Case1Handler as a tool"

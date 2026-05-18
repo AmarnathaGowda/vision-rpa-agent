@@ -1,0 +1,30 @@
+# Case 1 — Allstate fixture run.
+#
+# Same task as case1_already_closed.yaml but with the real Allstate-duplicate
+# fixture: header references 0823814694 (filed-but-rejected duplicate),
+# body references 0819963926 (the actual closed claim). Expected branch:
+# only_body_valid → Already Closed → status=success.
+
+task_id: case1_allstate_fixture
+task_type: case1
+app: tool
+goal: "Evaluate the Allstate duplicate-claim letter."
+
+steps:
+  - action_type: extract
+    target: case1_evaluate
+    app: tool
+    value: |
+      {"candidates": [
+        {"value": "0823814694", "role": "header",
+         "line": "Re: Claim Number 0823814694",
+         "line_index": 3, "confidence": 0.99},
+        {"value": "0819963926", "role": "body",
+         "line": "the correct claim number is 0819963926",
+         "line_index": 14, "confidence": 0.99}
+       ],
+       "raw_text": "Re: Claim Number 0823814694\nthe correct claim number is 0819963926\nrespectfully closing this duplicate.",
+       "cleaned_lines": [],
+       "ocr_used": false,
+       "duration_ms": 0}
+    reason: "evaluate the Allstate duplicate fixture"

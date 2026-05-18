@@ -37,9 +37,10 @@ ROUTING_TABLE: dict[str, str] = {
     "rdp_launch":     "rdp",
     "rdp_reconnect":  "rdp",
     "rdp_disconnect": "rdp",
-    # No-op
-    "flag_human": "noop",
-    "noop":       "noop",
+    # No-op (loop handles these as exits/flags, not executor dispatches)
+    "flag_human":    "noop",
+    "noop":          "noop",
+    "task_complete": "noop",
 }
 
 
@@ -48,11 +49,16 @@ class ActionRouter:
                  browser: Any | None = None,
                  desktop: Any | None = None,
                  rdp: Any | None = None,
-                 file: Any | None = None) -> None:
+                 file: Any | None = None,
+                 tool: Any | None = None) -> None:
         self.browser = browser
         self.desktop = desktop
         self.rdp = rdp
         self.file = file
+        # `tool` is used for evaluation-only actions that invoke pure-Python
+        # legacy handlers (Case 1 evaluator, validators, etc.) — see
+        # executors/case1_tool.py.
+        self.tool = tool
 
     def execute(self, plan: ActionPlan) -> ActionResult:
         scope = self._scope_for(plan)
@@ -67,6 +73,7 @@ class ActionRouter:
             "desktop": self.desktop,
             "rdp":     self.rdp,
             "file":    self.file,
+            "tool":    self.tool,
         }.get(scope)
 
         if executor is None:

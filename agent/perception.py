@@ -96,12 +96,30 @@ class PerceptionLayer:
             self._provider = get_provider()
         return self._provider
 
+    # Optional Playwright page reference — when set, ``capture()`` uses
+    # ``page.screenshot()`` instead of mss so the perception always sees the
+    # browser content even if focus shifts. Set by AgentLoop when the active
+    # executor is a BrowserExecutor.
+    page = None
+
     def capture(self, target: dict | None = None) -> Image.Image:
         """Grab the primary monitor or a specific bbox.
 
+        If a Playwright ``page`` is attached, prefer page.screenshot() —
+        captures the rendered browser content directly, immune to focus
+        shifts and other-window contamination. Falls through to mss when
+        no page is available (desktop / RDP flows).
+
         target schema (all optional): {"left": int, "top": int, "width": int, "height": int}.
-        Defaults to the primary monitor.
         """
+        if self.page is not None and target is None:
+            try:
+                import io as _io
+                png_bytes = self.page.screenshot(type="png", full_page=False)
+                return Image.open(_io.BytesIO(png_bytes)).convert("RGB")
+            except Exception as e:  # noqa: BLE001 — fall back to mss if page dies
+                log.warning("page_screenshot_failed_falling_back_to_mss",
+                            error=str(e))
         import mss  # local import — mss isn't available on every CI image
 
         with mss.mss() as sct:
@@ -141,7 +159,21 @@ class PerceptionLayer:
                 max_tokens=_active_max_tokens(1024),
             )
         )
-        return self._parse_screen_state(raw)
+        state = self._parse_screen_state(raw)
+        # Ground-truth override: the VLM hallucinates URLs from the goal.
+        # When a Playwright page is wired up, page.url is authoritative.
+        if self.page is not None:
+            try:
+                real_url = self.page.url or ""
+                state.current_url = real_url
+                # If the page is genuinely blank, ignore the hallucinated
+                # state_summary — downstream rules need to know it's blank.
+                if real_url in ("", "about:blank", "chrome://newtab/"):
+                    state.state_summary = "blank page — no application loaded yet"
+                    state.visible_elements = []
+            except Exception as e:  # noqa: BLE001
+                log.warning("page_url_check_failed", error=str(e))
+        return state
 
     def _parse_screen_state(self, raw: str) -> ScreenState:
         """Parse VLM output into a ScreenState — degrade gracefully on bad output.
@@ -181,4 +213,35 @@ class PerceptionLayer:
         except (TypeError, ValueError):
             conf = 0.0
         data["confidence"] = max(0.0, min(1.0, conf))
+
+        # ── Strip unverified testids ─────────────────────────────────
+        # The VLM frequently hallucinates testids from the screen
+        # (e.g. reads "login-username" as "user-input"). Passing those
+        # downstream causes the planner to emit a selector that doesn't
+        # exist on the page. Cross-check every reported testid against
+        # the locator map; drop it if it can't be verified. The label
+        # and element type are kept — that's enough for the planner to
+        # describe the target in friendly terms, and the SelectorResolver
+        # / locator map will produce the real selector.
+        try:
+            from config.locators.rdweb import ALL as _LOCATOR_MAP
+        except Exception:  # noqa: BLE001
+            _LOCATOR_MAP = {}
+        # Build a set of known testid substrings from the locator map values.
+        _known_testid_fragments = set()
+        for sel in _LOCATOR_MAP.values():
+            # Pull "foo-bar" out of any `[data-testid="foo-bar"]` we find.
+            for chunk in sel.split("data-testid="):
+                if not chunk or chunk[0] not in ('"', "'"):
+                    continue
+                quote = chunk[0]
+                end = chunk.find(quote, 1)
+                if end > 1:
+                    _known_testid_fragments.add(chunk[1:end])
+
+        for el in data.get("visible_elements") or []:
+            tid = el.get("testid")
+            if tid and tid not in _known_testid_fragments:
+                el["testid"] = ""  # drop the hallucinated testid
+
         return data
