@@ -28,6 +28,10 @@ ActionType = Literal[
     # navigate the current tab to that URL. Used for RDWeb-style "launch
     # app via HTML launcher" patterns (e.g. clicking the Loss Drafts tile).
     "click_download_open",
+    # Click a link with target="_blank". Capture the new tab's URL,
+    # close the popup, return the URL as extracted_value. Used for the
+    # Case 1 PDF link which opens in a popup tab.
+    "click_open_popup",
 ]
 
 ExecutorScope = Literal["browser", "desktop", "rdp", "file", "tool", "auto"]

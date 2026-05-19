@@ -27,6 +27,7 @@ ROUTING_TABLE: dict[str, str] = {
     "wait":                "browser",
     "js_eval":             "browser",
     "click_download_open": "browser",
+    "click_open_popup":    "browser",
     # Desktop-only
     "select_option": "desktop",
     # File Explorer / network share / extraction

@@ -116,6 +116,12 @@ def _build_router(task: dict, agent_id: str):
     from config.locators import rdweb
 
     scopes = _scopes_for_task(task)
+    # Case 1 (and similar) flows use the `tool` executor via deterministic
+    # guardrails that don't appear in the task YAML's pre-declared steps.
+    # Auto-register the tool executor for these tasks so guardrails can
+    # emit `extract → case1_*` (with app=tool) and dispatch correctly.
+    if (task.get("task_type") or "").startswith("case"):
+        scopes.add("tool")
     cleanups: list = []
 
     browser_executor = None

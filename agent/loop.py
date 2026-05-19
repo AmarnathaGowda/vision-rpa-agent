@@ -553,7 +553,324 @@ class AgentLoop:
         except Exception as e:  # noqa: BLE001 — last-line safety net
             result = ActionResult(status="failed", error_msg=repr(e))
         result.duration_ms = int((time.monotonic() - start) * 1000)
+        # Deterministic post-action: check if the current URL satisfies the
+        # current stage's exit pattern. If so, auto-advance stage and set
+        # the done_when keys — no LLM judgement required.
+        self._maybe_auto_advance_stage()
         return result
+
+    # ── SSO form state tracker ──────────────────────────────────────────
+    def _update_sso_state(self, plan: ActionPlan, result: ActionResult,
+                           screen: ScreenState) -> None:
+        """Maintain ``extracted_values["sso_state"]`` so the planner's SSO
+        guardrail knows what's been filled on the SAML/SSO page.
+
+        - When the page URL path contains `/sso/` and a `type` action just
+          succeeded on USERNAME or PASSWORD, mark the corresponding flag.
+        - When a `click → Sign On` succeeds, clear the state so a return
+          trip (failed credentials, etc.) re-fills the form fresh.
+        - When we leave the /sso/ path entirely, clear the state too —
+          the SSO leg is over.
+        """
+        if self.working is None:
+            return
+        url = (screen.current_url or "")
+        try:
+            from urllib.parse import urlparse
+            path = urlparse(url).path or ""
+        except Exception:  # noqa: BLE001
+            path = url
+        if "/sso/" not in path:
+            # Leaving SSO — clear any lingering state.
+            self.working.extracted_values.pop("sso_state", None)
+            return
+        if result.status != "ok":
+            return
+        sso_state = self.working.extracted_values.setdefault("sso_state", {})
+        target_lower = (plan.target or "").lower()
+        if plan.action_type == "type":
+            if "user" in target_lower:
+                sso_state["username_filled"] = True
+            elif "password" in target_lower:
+                sso_state["password_filled"] = True
+        elif plan.action_type == "click" and "sign on" in target_lower:
+            # Submitted — clear state so a failed SSO round re-fills.
+            self.working.extracted_values.pop("sso_state", None)
+
+    # ── Case 1 tool result absorption ─────────────────────────────────
+    def _absorb_case1_tool_result(self, plan: ActionPlan,
+                                    result: ActionResult) -> None:
+        """When a case1_* tool returns a JSON dict in extracted_value,
+        copy the recognised keys into working memory so the workflow's
+        done_when gates can see them.
+
+        Specifically: case1_extract_pdf produces ``candidates``,
+        ``raw_text``, ``cleaned_lines``, ``ocr_used``. The done_when
+        guard for stage `pdf_extraction` watches for ``candidates``.
+        """
+        if self.working is None or result.status != "ok":
+            return
+        if plan.target not in ("case1_extract_pdf",):
+            return
+        raw = result.extracted_value or ""
+        if not raw:
+            return
+        try:
+            import json as _json
+            payload = _json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            log.warning("case1_tool_result_parse_failed",
+                        target=plan.target, error=str(e))
+            return
+        if not isinstance(payload, dict):
+            return
+        # Copy the recognised keys verbatim.
+        for key in ("candidates", "raw_text", "cleaned_lines", "ocr_used"):
+            if key in payload:
+                self.working.extracted_values[key] = payload[key]
+        candidates = payload.get("candidates") or []
+        # Log the actual extracted values explicitly so the operator can
+        # see them in the runtime UI's live activity (not just a count).
+        candidate_summary = [
+            {"role": c.get("role"), "value": c.get("value"),
+             "confidence": c.get("confidence")}
+            for c in candidates
+        ]
+        log.info("case1_tool_result_absorbed",
+                 target=plan.target,
+                 candidates_count=len(candidates))
+        log.info("case1_candidates_extracted",
+                 task_id=self.working.task_id,
+                 candidates=candidate_summary,
+                 raw_text_chars=len(payload.get("raw_text") or ""))
+        self.audit.append("case1_candidates_extracted",
+                          task_id=self.working.task_id,
+                          step=self.working.step,
+                          candidates=candidate_summary,
+                          ocr_used=bool(payload.get("ocr_used")))
+
+    # ── Document-management state tracker ─────────────────────────────
+    def _update_doc_mgmt_state(self, plan: ActionPlan, result: ActionResult,
+                                 screen: ScreenState) -> None:
+        """Maintain doc_state and pdf_url in working memory so the doc-mgmt
+        guardrail knows what to do next.
+
+        - When a click succeeds on a target containing "case1-row", flip
+          doc_state.row_clicked → True.
+        - When a click_open_popup succeeds on a target containing
+          "case1-link", capture the returned URL as pdf_url.
+        """
+        if self.working is None or result.status != "ok":
+            return
+        target_lower = (plan.target or "").lower()
+        if plan.action_type == "click" and "case1-row" in target_lower:
+            doc_state = self.working.extracted_values.setdefault("doc_state", {})
+            doc_state["row_clicked"] = True
+            log.info("doc_mgmt_row_clicked", target=plan.target)
+        if (plan.action_type == "click_open_popup"
+                and "case1-link" in target_lower
+                and result.extracted_value):
+            self.working.extracted_values["pdf_url"] = result.extracted_value
+            log.info("doc_mgmt_pdf_url_captured",
+                     pdf_url=result.extracted_value)
+
+    # ── Claim-validation state tracker ───────────────────────────────
+    def _update_validation_state(self, plan: ActionPlan,
+                                   result: ActionResult) -> None:
+        """Drive the claim_validation state machine that the planner's
+        Rule 6 reads.
+
+        State shape in ``extracted_values["validation_state"]``:
+            {"index": int, "step": "type"|"submit"|"probe"|"select"|"check_closed",
+             "pending_loan_no": str}
+
+        Transitions on successful actions:
+          - type   → ld-doc-search-claim       → step="submit"
+          - click  → ld-doc-search-submit      → step="probe"
+          - js_eval→ claim_search_result_probe →
+                if "empty"/"unknown" → record not-found entry, index++, step="type"
+                if "found:<loan>"    → stash loan_no, step="select"
+          - click  → ld-doc-claim-row-<loan>   → step="check_closed"
+          - js_eval→ claim_closed_status_probe → record found entry with
+                closed flag, index++, step="type"
+        """
+        if self.working is None or result.status != "ok":
+            return
+        if (self.working.current_stage or "") != "claim_validation":
+            return
+        ev = self.working.extracted_values
+        candidates = ev.get("candidates") or []
+        if not candidates:
+            return
+        state = ev.setdefault("validation_state", {"index": 0, "step": "type"})
+        target = (plan.target or "").lower()
+        idx = int(state.get("index", 0))
+
+        if plan.action_type == "type" and "ld-doc-search-claim" in target:
+            state["step"] = "submit"
+            return
+        if plan.action_type == "click" and "ld-doc-search-submit" in target:
+            state["step"] = "probe"
+            return
+        if (plan.action_type == "js_eval"
+                and target == "claim_search_result_probe"):
+            if idx >= len(candidates):
+                return
+            probe = (result.extracted_value or "").strip().strip('"')
+            cand = candidates[idx]
+            if probe.startswith("found:"):
+                state["pending_loan_no"] = probe.split(":", 1)[1]
+                state["step"] = "select"
+                log.info("claim_search_match",
+                         claim_id=cand.get("value"),
+                         loan_no=state["pending_loan_no"])
+                return
+            # empty / unknown → record immediately, advance.
+            entry = {"claim_id": cand.get("value", ""),
+                     "role": cand.get("role", "?"),
+                     "found": False, "loan_no": None, "closed": None,
+                     "note": ("empty-results marker present"
+                              if probe == "empty"
+                              else f"probe returned {probe!r}")}
+            self._append_validation(ev, state, entry, candidates)
+            return
+        if (plan.action_type == "click"
+                and target.startswith("ld-doc-claim-row-")):
+            state["step"] = "check_closed"
+            return
+        if (plan.action_type == "js_eval"
+                and target == "claim_closed_status_probe"):
+            if idx >= len(candidates):
+                return
+            probe = (result.extracted_value or "").strip().strip('"')
+            cand = candidates[idx]
+            loan_no = state.get("pending_loan_no")
+            entry = {"claim_id": cand.get("value", ""),
+                     "role": cand.get("role", "?"),
+                     "found": True, "loan_no": loan_no,
+                     "closed": (probe == "closed"),
+                     "note": f"selected row; status probe={probe}"}
+            state.pop("pending_loan_no", None)
+            self._append_validation(ev, state, entry, candidates)
+            return
+
+    def _append_validation(self, ev: dict, state: dict, entry: dict,
+                             candidates: list) -> None:
+        """Finalize one candidate's validation result and advance the index."""
+        assert self.working is not None
+        validations = ev.setdefault("validations", [])
+        validations.append(entry)
+        state["index"] = int(state.get("index", 0)) + 1
+        state["step"] = "type"
+        log.info("claim_validation_recorded",
+                 task_id=self.working.task_id,
+                 claim_id=entry.get("claim_id"), role=entry.get("role"),
+                 found=entry.get("found"), loan_no=entry.get("loan_no"),
+                 closed=entry.get("closed"),
+                 progress=f"{len(validations)}/{len(candidates)}")
+        self.audit.append("claim_validation_recorded",
+                          task_id=self.working.task_id,
+                          step=self.working.step, **entry)
+        # If we've found any closed claim, synthesize case1_result eagerly —
+        # the Case 1 "Already Closed" rule is satisfied as soon as one
+        # candidate's claim ID maps to a closed claim in the system.
+        if entry.get("closed") and not ev.get("case1_result"):
+            ev["case1_result"] = {
+                "verdict": "Claim already closed",
+                "matched_claim_id": entry.get("claim_id"),
+                "matched_role": entry.get("role"),
+                "loan_no": entry.get("loan_no"),
+            }
+            # Short-circuit path bypasses cross_verify — set a stub
+            # pdf_identity so the done_when.all_set completion gate
+            # doesn't block task_complete.
+            ev.setdefault("pdf_identity", {
+                "source": "short_circuit",
+                "note": "skipped — closed-claim verdict reached early",
+            })
+            log.info("case1_result_synthesized",
+                     task_id=self.working.task_id,
+                     verdict="Claim already closed",
+                     matched=entry.get("claim_id"))
+
+    # ── Deterministic stage advancement ─────────────────────────────────
+    def _maybe_auto_advance_stage(self) -> None:
+        """If the page URL now matches the current stage's exit pattern,
+        advance current_stage and set the listed done_when keys. Reads
+        the stages map from the task YAML (optional)."""
+        if self.working is None or self.task_goal is None:
+            return
+        stages = (self.task_goal.raw or {}).get("stages") or []
+        if not stages:
+            return
+        current = self.working.current_stage or ""
+        stage_def = next((s for s in stages if s.get("name") == current), None)
+        if not stage_def:
+            return
+        # Exit-by-keys: when all listed keys are in extracted_values
+        # (truthy), advance the stage. Use this for data-based exits
+        # (e.g. "pdf_url captured") instead of URL transitions.
+        exit_keys_set = stage_def.get("exit_keys_set") or []
+        if exit_keys_set:
+            ev = self.working.extracted_values
+            if all(ev.get(k) for k in exit_keys_set):
+                # Special-case: claim_validation's `validations` list is
+                # truthy after the FIRST candidate finishes, but the stage
+                # is only complete when one entry exists per candidate.
+                if current == "claim_validation":
+                    cands = ev.get("candidates") or []
+                    vals = ev.get("validations") or []
+                    if len(vals) < len(cands):
+                        return
+                self._do_stage_advance(stage_def, current, url="(keys set)",
+                                        keys_set=stage_def.get("sets_keys") or [])
+                return
+
+        pattern = (stage_def.get("exit_url_substring") or "").strip()
+        if not pattern:
+            return
+        # Pull the URL from the browser executor if available.
+        try:
+            page = getattr(self.executor, "browser", None) and self.executor.browser.page
+            url = (page.url if page else "") or ""
+        except Exception:  # noqa: BLE001
+            url = ""
+        # Match against the URL PATH only (not the query string). Without
+        # this, an exit pattern like "/lossdrafts/" would falsely match
+        # mid-SSO at `?ReturnUrl=/lossdrafts/`, advancing the stage before
+        # the redirect chain has actually settled.
+        from urllib.parse import urlparse
+        try:
+            url_path = urlparse(url).path or ""
+        except Exception:  # noqa: BLE001
+            url_path = url
+        if pattern not in url_path:
+            return
+        self._do_stage_advance(stage_def, current, url=url,
+                                keys_set=stage_def.get("sets_keys") or [])
+
+    def _do_stage_advance(self, stage_def: dict, current: str, *,
+                            url: str, keys_set: list) -> None:
+        assert self.working is not None
+        next_stage = stage_def.get("next") or ""
+        for key in keys_set:
+            self.working.extracted_values.setdefault(key, True)
+        if current and current not in self.working.stages_completed:
+            self.working.stages_completed.append(current)
+        self.working.current_stage = next_stage
+        log.info("stage_auto_advanced",
+                 task_id=self.working.task_id,
+                 from_stage=current,
+                 to_stage=next_stage,
+                 url=url,
+                 keys_set=keys_set)
+        self.audit.append("stage_auto_advanced",
+                          task_id=self.working.task_id,
+                          step=self.working.step,
+                          from_stage=current,
+                          to_stage=next_stage,
+                          url=url,
+                          keys_set=keys_set)
 
     def _store(self, plan: ActionPlan, result: ActionResult, screen: ScreenState) -> None:
         assert self.working is not None
@@ -575,6 +892,24 @@ class AgentLoop:
         # they can re-submit. Avoids the planner re-injecting stale hints.
         if "human_guidance" in self.working.extracted_values:
             self.working.extracted_values.pop("human_guidance", None)
+
+        # SSO form state tracker — feeds the planner's deterministic SSO
+        # guardrail. We record what was just typed on /sso/ pages so the
+        # next iteration knows whether USERNAME / PASSWORD are filled.
+        self._update_sso_state(plan, result, screen)
+
+        # Document-management state tracker.
+        self._update_doc_mgmt_state(plan, result, screen)
+
+        # Case 1 tool result absorption (extract_pdf, etc.) — when a tool
+        # returns a JSON payload with case1-shaped keys, copy them into
+        # working memory so stage gates and downstream guardrails can see
+        # them.
+        self._absorb_case1_tool_result(plan, result)
+
+        # Claim-validation state machine — drives the per-candidate
+        # type → submit → probe loop on stage claim_validation.
+        self._update_validation_state(plan, result)
 
         if result.status == "failed":
             key = str(step)

@@ -232,6 +232,9 @@ class BrowserExecutor:
             # Return the launched URL so the loop can record it in working
             # memory (e.g. as `pdf_url` or `launcher_url`).
             return launch_url or "", self._snap(plan)
+        if plan.action_type == "click_open_popup":
+            popup_url = self.click_open_popup(plan.target, fallback=plan.fallback)
+            return popup_url or "", self._snap(plan)
         if plan.action_type == "type":
             self.fill(plan.target, resolved_value, fallback=plan.fallback)
             return "", self._snap(plan)
@@ -339,6 +342,78 @@ class BrowserExecutor:
         self.page.goto(launch_url, wait_until="domcontentloaded",
                         timeout=self.DEFAULT_TIMEOUT_MS * 2)
         return launch_url
+
+    def click_open_popup(self, target: str,
+                          fallback: str | None = None) -> str:
+        """Click a link with target="_blank". Capture the popup's URL,
+        download its bytes via the authenticated browser context, save
+        them to a local file, close the popup, and return the LOCAL
+        FILE PATH (not the URL).
+
+        Why download via the browser context: the popup target is often
+        an authenticated endpoint (e.g. /lossdrafts/document/<id>.pdf
+        redirects to /login.aspx for unauthenticated callers). Playwright
+        keeps the session cookies on `page.context`; fetching via
+        `page.context.request.get(url)` carries them and we get the
+        actual bytes. This mirrors the legacy demo's
+        `context.request.get(pdf_full_url)` pattern.
+        """
+        sel = self.resolver.resolve(self.page, target, fallback=fallback)
+        log.info("browser_click_open_popup_start",
+                 target=target, selector=sel.selector, strategy=sel.strategy)
+        with self.page.context.expect_page(
+            timeout=self.DEFAULT_TIMEOUT_MS * 2
+        ) as pop_info:
+            self.page.locator(sel.selector).first.click(
+                timeout=self.DEFAULT_TIMEOUT_MS,
+                no_wait_after=True,
+            )
+        popup = pop_info.value
+        try:
+            popup.wait_for_load_state("domcontentloaded",
+                                       timeout=self.DEFAULT_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001 — PDF viewers may never fire it.
+            pass
+        popup_url = popup.url or ""
+        log.info("browser_popup_captured", url=popup_url)
+
+        # Download the file bytes via the AUTHENTICATED browser context.
+        local_path = ""
+        if popup_url:
+            try:
+                resp = self.page.context.request.get(popup_url)
+                if resp.ok:
+                    body = resp.body()
+                    import time as _t
+                    suffix = ".pdf" if ".pdf" in popup_url.lower() else ".bin"
+                    self.screenshot_dir.parent.joinpath("downloads").mkdir(
+                        parents=True, exist_ok=True)
+                    local_path = str(
+                        self.screenshot_dir.parent / "downloads"
+                        / f"popup_{int(_t.time() * 1000)}{suffix}"
+                    )
+                    with open(local_path, "wb") as f:
+                        f.write(body)
+                    log.info("browser_popup_bytes_downloaded",
+                             url=popup_url,
+                             path=local_path,
+                             size_bytes=len(body))
+                else:
+                    log.warning("browser_popup_bytes_http_error",
+                                url=popup_url, status=resp.status)
+            except Exception as e:  # noqa: BLE001
+                log.warning("browser_popup_bytes_download_failed",
+                            url=popup_url, error=str(e))
+
+        try:
+            popup.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.page.bring_to_front()
+        # Prefer the local file path (downloaded with auth) over the URL,
+        # because the URL alone won't work for unauthenticated callers
+        # like a standalone httpx client.
+        return local_path or popup_url
 
     def fill(self, target: str, value: str, fallback: str | None = None) -> None:
         sel = self.resolver.resolve(self.page, target, fallback=fallback)

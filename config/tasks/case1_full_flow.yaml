@@ -73,6 +73,46 @@ goal: |
 # Initial stage when the task starts.
 initial_stage: login
 
+# Stages map — URL patterns that DETERMINISTICALLY advance the workflow.
+# After every action, the loop checks page.url; when it contains the
+# `exit_url_substring`, the stage transitions to `next` and the listed
+# `sets_keys` are written to working memory's extracted_values. No LLM
+# judgement required for these transitions — they're observed facts.
+#
+# Stages 3-7 (post-SSO) don't have URL transitions; they advance via
+# the LLM emitting stage_complete or by setting their done_when keys
+# via successful tool actions (extract_pdf, case1_evaluate, etc.).
+stages:
+  - name: login
+    exit_url_substring: /Default.aspx/Production
+    sets_keys: [rdweb_authenticated]
+    next: loss_drafts_launch
+  - name: loss_drafts_launch
+    # The chain after clicking Loss Drafts is:
+    #   /Production → /sso/idp/SSO.saml2 → /lossdrafts/
+    # We accept either /lossdrafts/ (after SSO settles) as the exit.
+    exit_url_substring: /lossdrafts/
+    sets_keys: [lossdrafts_loaded]
+    next: document_management
+  - name: document_management
+    # NO URL-based exit — landing on /document-management does not mean
+    # the stage is complete; we still need to click the row + open the
+    # PDF link. The exit is data-driven: pdf_url must be populated.
+    exit_keys_set: [pdf_url]
+    sets_keys: []
+    next: pdf_extraction
+  - name: pdf_extraction
+    exit_keys_set: [candidates]
+    sets_keys: []
+    next: claim_validation
+  - name: claim_validation
+    # Per-candidate state machine: type claim ID → submit → probe result.
+    # The loop's _update_validation_state appends to `validations` until
+    # one entry exists per candidate, then advances.
+    exit_keys_set: [validations]
+    sets_keys: []
+    next: cross_verify
+
 # Deterministic completion gate — the loop only treats task_complete as
 # success when every key in done_when.all_set is present in
 # working.extracted_values. If the LLM emits task_complete early, the

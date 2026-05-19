@@ -154,6 +154,260 @@ def test_inject_completion_guidance_writes_human_guidance():
     store.conn.close()
 
 
+def test_auto_advance_stage_on_url_match(monkeypatch):
+    """When the executor's page URL matches a stage's exit_url_substring,
+    the loop should advance current_stage and set the listed done_when keys
+    — no LLM call required."""
+    from memory.session import SessionMemory
+    import sqlite3
+
+    store = SessionMemory.__new__(SessionMemory)
+    store.db_path = ":memory:"
+    store.conn = sqlite3.connect(":memory:", check_same_thread=False)
+    store.conn.execute("PRAGMA journal_mode=WAL")
+    store.conn.row_factory = sqlite3.Row
+    store._create_schema()
+
+    class _StubPage:
+        url = "http://localhost:8000/rdweb/pages/en-US/Default.aspx/Production"
+    class _StubBrowser:
+        page = _StubPage()
+    class _StubExec:
+        browser = _StubBrowser()
+        def execute(self, plan):
+            from agent.schemas import ActionResult
+            return ActionResult(status="ok")
+
+    loop = AgentLoop(session=store, executor=_StubExec(), agent_id="agent_test")
+    loop._init_task({
+        "task_id": "t-stage-advance", "task_type": "case1", "goal": "g",
+        "initial_stage": "login",
+        "stages": [
+            {"name": "login",
+             "exit_url_substring": "/Default.aspx/Production",
+             "sets_keys": ["rdweb_authenticated"],
+             "next": "loss_drafts_launch"},
+        ],
+    })
+    assert loop.working.current_stage == "login"
+    loop._maybe_auto_advance_stage()
+    assert loop.working.current_stage == "loss_drafts_launch"
+    assert loop.working.stages_completed == ["login"]
+    assert loop.working.extracted_values.get("rdweb_authenticated") is True
+    store.conn.close()
+
+
+def test_no_auto_advance_when_url_doesnt_match():
+    from memory.session import SessionMemory
+    import sqlite3
+
+    store = SessionMemory.__new__(SessionMemory)
+    store.db_path = ":memory:"
+    store.conn = sqlite3.connect(":memory:", check_same_thread=False)
+    store.conn.execute("PRAGMA journal_mode=WAL")
+    store.conn.row_factory = sqlite3.Row
+    store._create_schema()
+
+    class _StubPage:
+        url = "http://localhost:8000/rdweb/pages/en-US/login.aspx"
+    class _StubBrowser:
+        page = _StubPage()
+    class _StubExec:
+        browser = _StubBrowser()
+        def execute(self, plan):
+            from agent.schemas import ActionResult
+            return ActionResult(status="ok")
+
+    loop = AgentLoop(session=store, executor=_StubExec(), agent_id="agent_test")
+    loop._init_task({
+        "task_id": "t-no-advance", "task_type": "case1", "goal": "g",
+        "initial_stage": "login",
+        "stages": [
+            {"name": "login",
+             "exit_url_substring": "/Default.aspx/Production",
+             "sets_keys": ["rdweb_authenticated"],
+             "next": "loss_drafts_launch"},
+        ],
+    })
+    loop._maybe_auto_advance_stage()
+    # Still on login because URL doesn't contain /Default.aspx/Production.
+    assert loop.working.current_stage == "login"
+    assert loop.working.stages_completed == []
+    assert "rdweb_authenticated" not in loop.working.extracted_values
+    store.conn.close()
+
+
+def test_auto_advance_ignores_url_query_string():
+    """An exit pattern `/lossdrafts/` should NOT match an SSO URL like
+    `/sso/idp/SSO.saml2?ReturnUrl=/lossdrafts/`. The matcher must look at
+    the URL path only, not the query string."""
+    from memory.session import SessionMemory
+    import sqlite3
+
+    store = SessionMemory.__new__(SessionMemory)
+    store.db_path = ":memory:"
+    store.conn = sqlite3.connect(":memory:", check_same_thread=False)
+    store.conn.execute("PRAGMA journal_mode=WAL")
+    store.conn.row_factory = sqlite3.Row
+    store._create_schema()
+
+    class _StubPage:
+        url = "http://localhost:8000/sso/idp/SSO.saml2?ReturnUrl=/lossdrafts/"
+    class _StubBrowser:
+        page = _StubPage()
+    class _StubExec:
+        browser = _StubBrowser()
+        def execute(self, plan):
+            from agent.schemas import ActionResult
+            return ActionResult(status="ok")
+
+    loop = AgentLoop(session=store, executor=_StubExec(), agent_id="agent_test")
+    loop._init_task({
+        "task_id": "t-query", "task_type": "case1", "goal": "g",
+        "initial_stage": "loss_drafts_launch",
+        "stages": [
+            {"name": "loss_drafts_launch",
+             "exit_url_substring": "/lossdrafts/",
+             "sets_keys": ["lossdrafts_loaded"],
+             "next": "document_management"},
+        ],
+    })
+    loop._maybe_auto_advance_stage()
+    # SSO URL has /lossdrafts/ in the QUERY STRING, not the path → no advance.
+    assert loop.working.current_stage == "loss_drafts_launch"
+    assert loop.working.stages_completed == []
+    assert "lossdrafts_loaded" not in loop.working.extracted_values
+    store.conn.close()
+
+
+def test_planner_auto_clicks_doc_management_tab_when_stage_demands_it():
+    """When current_stage='document_management' but URL path is on a
+    different lossdrafts subpage (e.g. /lossdrafts/search), the planner
+    should deterministically emit click → Document Management."""
+    from agent.planner import ActionPlanner
+    from agent.schemas import ScreenState
+    from tests.fixtures.mock_llm import MockOpenAIClient, make_action_plan
+
+    # The LLM might want to click Search but the guardrail should override.
+    bad_payload = make_action_plan(action_type="click", target="Search",
+                                    confidence=1.0)
+    planner = ActionPlanner(client=MockOpenAIClient(responses=[bad_payload]))
+    screen = ScreenState(
+        app_type="browser",
+        state_summary="Claim Search results",
+        current_url="http://localhost:8000/lossdrafts/search",
+        confidence=0.95,
+    )
+    plan = planner.decide(
+        screen,
+        working={"step": 0, "current_stage": "document_management",
+                 "retry_counts": {}},
+        goal="case1_full_flow",
+    )
+    assert plan.action_type == "click"
+    assert plan.target == "Document Management"
+    assert "document_management" in (plan.reason or "").lower()
+
+
+def test_planner_sso_guardrail_fills_username_first():
+    """On the SSO page with empty form state, the planner must
+    deterministically emit `type → USERNAME` with the SSO placeholder."""
+    from agent.planner import ActionPlanner
+    from agent.schemas import ScreenState
+    from tests.fixtures.mock_llm import MockOpenAIClient, make_action_plan
+
+    # LLM would emit click-Sign-On (wrong, the form is empty), but the
+    # guardrail must override.
+    bad_payload = make_action_plan(action_type="click", target="Sign On",
+                                    confidence=1.0)
+    planner = ActionPlanner(client=MockOpenAIClient(responses=[bad_payload]))
+    screen = ScreenState(
+        app_type="browser",
+        state_summary="SAML SSO login form",
+        current_url="http://localhost:8000/sso/idp/SSO.saml2?ReturnUrl=/lossdrafts/",
+        confidence=0.9,
+    )
+    plan = planner.decide(
+        screen,
+        working={"step": 0, "extracted_values": {}, "retry_counts": {}},
+        goal="case1_full_flow",
+    )
+    assert plan.action_type == "type"
+    assert plan.target == "USERNAME"
+    assert "{{SSO_USERNAME}}" in (plan.value or "")
+
+
+def test_planner_sso_guardrail_fills_password_when_username_already_filled():
+    from agent.planner import ActionPlanner
+    from agent.schemas import ScreenState
+    from tests.fixtures.mock_llm import MockOpenAIClient, make_action_plan
+
+    bad_payload = make_action_plan(action_type="click", target="Sign On",
+                                    confidence=1.0)
+    planner = ActionPlanner(client=MockOpenAIClient(responses=[bad_payload]))
+    screen = ScreenState(
+        app_type="browser",
+        state_summary="SSO form",
+        current_url="http://localhost:8000/sso/idp/SSO.saml2",
+        confidence=0.9,
+    )
+    plan = planner.decide(
+        screen,
+        working={"step": 0, "retry_counts": {},
+                 "extracted_values": {"sso_state": {"username_filled": True}}},
+        goal="case1_full_flow",
+    )
+    assert plan.action_type == "type"
+    assert plan.target == "PASSWORD"
+    assert "{{SSO_PASSWORD}}" in (plan.value or "")
+
+
+def test_planner_sso_guardrail_clicks_sign_on_when_both_filled():
+    from agent.planner import ActionPlanner
+    from agent.schemas import ScreenState
+    from tests.fixtures.mock_llm import MockOpenAIClient, make_action_plan
+
+    bad_payload = make_action_plan(action_type="navigate", target="/elsewhere",
+                                    confidence=1.0)
+    planner = ActionPlanner(client=MockOpenAIClient(responses=[bad_payload]))
+    screen = ScreenState(
+        app_type="browser",
+        state_summary="SSO form filled",
+        current_url="http://localhost:8000/sso/idp/SSO.saml2",
+        confidence=0.9,
+    )
+    plan = planner.decide(
+        screen,
+        working={"step": 0, "retry_counts": {},
+                 "extracted_values": {"sso_state": {
+                     "username_filled": True,
+                     "password_filled": True}}},
+        goal="case1_full_flow",
+    )
+    assert plan.action_type == "click"
+    assert plan.target == "Sign On"
+
+
+def test_planner_blocks_destructive_click():
+    """A click on 'Logout' (or similar) during workflow should be flagged
+    for HITL with a clear destructive-action message."""
+    from agent.planner import ActionPlanner
+    from agent.schemas import ActionPlan, ScreenState
+    from tests.fixtures.mock_llm import MockOpenAIClient, make_action_plan
+
+    plan_payload = make_action_plan(action_type="click", target="Logout",
+                                    confidence=1.0)
+    planner = ActionPlanner(client=MockOpenAIClient(responses=[plan_payload]))
+    screen = ScreenState(app_type="browser", state_summary="claim list",
+                         confidence=0.9)
+    plan = planner.decide(screen, working={"step": 0,
+                                            "current_stage": "claim_validation"},
+                           goal="case 1 e2e")
+    assert plan.requires_hitl is True
+    assert "BLOCKED" in (plan.reason or "")
+    assert "Logout" in (plan.reason or "")
+
+
 def test_missing_completion_keys_no_done_when_returns_empty():
     """Tasks without done_when (the legacy case) should never block."""
     from memory.session import SessionMemory

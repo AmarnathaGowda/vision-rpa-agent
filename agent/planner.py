@@ -278,6 +278,11 @@ class ActionPlanner:
         """
         url_now = (screen.current_url or "").strip()
         goal_urls = self._URL_RE.findall(goal or "")
+        from urllib.parse import urlparse
+        try:
+            path_now = urlparse(url_now).path or ""
+        except Exception:  # noqa: BLE001
+            path_now = ""
 
         # Rule 1: blank page + goal mentions a URL → navigate.
         if url_now in self._BLANK_URLS and goal_urls:
@@ -292,6 +297,217 @@ class ActionPlanner:
                 requires_hitl=False,
                 cache_hit=True,
             )
+
+        # Rule 2 (must run BEFORE the doc-management guardrail): on the
+        # SAML/SSO page, drive the form completely. The VLM mis-perceives
+        # the SSO page as the RD Web login form, so the LLM picks the wrong
+        # credentials and frequently clicks Sign On without filling fields.
+        # We KNOW this form (USERNAME, PASSWORD, Sign On) — script it.
+        if "/sso/" in path_now:
+            sso_state = (working.get("extracted_values") or {}).get(
+                "sso_state") or {}
+            if not sso_state.get("username_filled"):
+                return ActionPlan(
+                    action_type="type",
+                    target="USERNAME",
+                    value="{{SSO_USERNAME}}",
+                    reason=("SSO guardrail: fill USERNAME with the SSO "
+                            "credential (NOT the RDWEB one)."),
+                    confidence=1.0,
+                    requires_hitl=False,
+                    cache_hit=True,
+                )
+            if not sso_state.get("password_filled"):
+                return ActionPlan(
+                    action_type="type",
+                    target="PASSWORD",
+                    value="{{SSO_PASSWORD}}",
+                    reason=("SSO guardrail: fill PASSWORD with the SSO "
+                            "credential."),
+                    confidence=1.0,
+                    requires_hitl=False,
+                    cache_hit=True,
+                )
+            # Both fields filled — submit.
+            return ActionPlan(
+                action_type="click",
+                target="Sign On",
+                reason=("SSO guardrail: USERNAME + PASSWORD filled — "
+                        "submit the form."),
+                confidence=1.0,
+                requires_hitl=False,
+                cache_hit=True,
+            )
+
+        # Rule 3: stage=document_management but the agent is NOT on the
+        # document-management page yet (e.g. landed on Claim Search by
+        # default after SSO). The SOP requires clicking the Document
+        # Management tab first — emit that deterministically.
+        if (working.get("current_stage") == "document_management"
+                and "/lossdrafts" in path_now
+                and "/document-management" not in path_now):
+            return ActionPlan(
+                action_type="click",
+                target="Document Management",
+                reason=("guardrail: stage=document_management requires the "
+                        "Document Management tab to be active before any "
+                        "row selection or document interaction."),
+                confidence=1.0,
+                requires_hitl=False,
+                cache_hit=True,
+            )
+
+        # Rule 4: on /document-management page in document_management
+        # stage, drive the row+link state machine deterministically.
+        # Matches the legacy `run_case1_e2e_demo.py` flow:
+        #   1. Click the Case 1 row (selects it)
+        #   2. Click the Link in that row (opens PDF in new tab)
+        #   3. Capture the popup URL as pdf_url
+        if (working.get("current_stage") == "document_management"
+                and "/document-management" in path_now):
+            extracted = working.get("extracted_values") or {}
+            if not extracted.get("pdf_url"):
+                doc_state = extracted.get("doc_state") or {}
+                if not doc_state.get("row_clicked"):
+                    return ActionPlan(
+                        action_type="click",
+                        target="case1-row",
+                        reason=("doc-mgmt guardrail: select the Case 1 row "
+                                "in the Pending Scanned Documents table."),
+                        confidence=1.0,
+                        requires_hitl=False,
+                        cache_hit=True,
+                    )
+                return ActionPlan(
+                    action_type="click_open_popup",
+                    target="case1-link",
+                    reason=("doc-mgmt guardrail: open the Case 1 Link "
+                            "(PDF popup) and capture its URL."),
+                    confidence=1.0,
+                    requires_hitl=False,
+                    cache_hit=True,
+                )
+
+        # Rule 5: on pdf_extraction stage, run the OCR pipeline against
+        # the captured pdf_url via the case1_extract_pdf tool, which
+        # downloads the PDF then calls the legacy extract_from_pdf
+        # (the only pipeline that produces `candidates` with header/body
+        # roles, which Case 1's evaluator needs).
+        if (working.get("current_stage") == "pdf_extraction"
+                and (working.get("extracted_values") or {}).get("pdf_url")
+                and not (working.get("extracted_values") or {}).get("candidates")):
+            pdf_url = working["extracted_values"]["pdf_url"]
+            return ActionPlan(
+                action_type="extract",
+                target="case1_extract_pdf",
+                value=pdf_url,
+                app="tool",
+                reason=("pdf-extraction guardrail: download the PDF and "
+                        "run the legacy OCR pipeline → candidates."),
+                confidence=1.0,
+                requires_hitl=False,
+                cache_hit=True,
+            )
+
+        # Rule 6: on claim_validation stage, deterministically search each
+        # extracted candidate's claim ID in the Claim Search panel (on the
+        # same /document-management page). State machine in working memory:
+        #   validation_state = {"index": <int>, "step": "type"|"submit"|"read"}
+        # When all candidates are processed, write `validations` list and
+        # let the stage auto-advance.
+        if working.get("current_stage") == "claim_validation":
+            extracted = working.get("extracted_values") or {}
+            candidates = extracted.get("candidates") or []
+            validations = extracted.get("validations") or []
+            if candidates and len(validations) < len(candidates):
+                state = extracted.get("validation_state") or {}
+                idx = int(state.get("index", len(validations)))
+                step = state.get("step", "type")
+                if idx >= len(candidates):
+                    return None
+                claim_id = candidates[idx].get("value", "")
+                if step == "type":
+                    return ActionPlan(
+                        action_type="type",
+                        target="ld-doc-search-claim",
+                        value=claim_id,
+                        reason=(f"claim-validation guardrail: type "
+                                f"candidate {idx+1}/{len(candidates)} "
+                                f"({candidates[idx].get('role','?')}) "
+                                f"into the Claim search field."),
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+                if step == "submit":
+                    return ActionPlan(
+                        action_type="click",
+                        target="ld-doc-search-submit",
+                        reason="claim-validation guardrail: submit the Claim search.",
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+                if step == "probe":
+                    return ActionPlan(
+                        action_type="js_eval",
+                        target="claim_search_result_probe",
+                        value=(
+                            # Returns: "empty" | "found:<loan_no>" | "unknown"
+                            "(() => {"
+                            " const empty = document.querySelector("
+                            "  \"[data-testid='ld-doc-claim-results-empty']\");"
+                            " if (empty) return 'empty';"
+                            " const row = document.querySelector("
+                            "  \"[data-testid^='ld-doc-claim-row-']\");"
+                            " if (row) {"
+                            "  const tid = row.getAttribute('data-testid')||'';"
+                            "  return 'found:' + tid.replace('ld-doc-claim-row-','');"
+                            " }"
+                            " return 'unknown';"
+                            "})()"
+                        ),
+                        reason="claim-validation guardrail: probe results panel.",
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+                if step == "select":
+                    loan_no = state.get("pending_loan_no") or ""
+                    return ActionPlan(
+                        action_type="click",
+                        target=f"ld-doc-claim-row-{loan_no}",
+                        reason=(f"claim-validation guardrail: select the "
+                                f"matched result row (loan_no={loan_no})."),
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+                # Short-circuit: as soon as case1_result is synthesized
+                # (closed claim found), end the task — no need to keep
+                # validating other candidates.
+                if extracted.get("case1_result"):
+                    return ActionPlan(
+                        action_type="task_complete",
+                        target="",
+                        reason=("Case 1 'Already Closed' verdict reached: "
+                                f"{extracted['case1_result'].get('verdict')}. "
+                                "Short-circuiting remaining stages."),
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+                if step == "check_closed":
+                    return ActionPlan(
+                        action_type="js_eval",
+                        target="claim_closed_status_probe",
+                        value=(
+                            # Returns: "closed" | "open" — based on the
+                            # banner + status badge rendered after selection.
+                            "(() => {"
+                            " const banner = document.querySelector("
+                            "  \"[data-testid='ld-closed-claim-banner']\");"
+                            " if (banner) return 'closed';"
+                            " const badge = document.querySelector("
+                            "  '.ld-status-closed');"
+                            " if (badge) return 'closed';"
+                            " return 'open';"
+                            "})()"
+                        ),
+                        reason=("claim-validation guardrail: check whether "
+                                "the selected claim is Closed."),
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
         return None
 
     def _known_targets_context(self) -> str:
@@ -402,15 +618,42 @@ class ActionPlanner:
     # have to remember the right primitive on every run.
     LAUNCHER_TARGETS = {"loss drafts", "loss draft", "lossdrafts"}
 
+    # Destructive click targets that the LLM occasionally picks when
+    # confused (e.g. "Logout" / "Sign out" to escape a stuck state).
+    # During an active workflow this destroys the session and forces the
+    # operator to restart. We intercept and route to HITL instead.
+    DESTRUCTIVE_TARGETS = {
+        "logout", "log out", "sign out", "signout",
+        "cancel", "close", "exit", "abort",
+        "delete", "remove", "discard",
+    }
+
     def _enforce_action_rules(self, plan: ActionPlan) -> ActionPlan:
         """Deterministic plan rewrites that don't depend on LLM judgement."""
+        target_norm = (plan.target or "").lower().strip()
         if plan.action_type == "click":
-            target_norm = (plan.target or "").lower().strip()
             if target_norm in self.LAUNCHER_TARGETS:
                 log.info("planner_upgraded_click_to_download_open",
                          target=plan.target,
                          reason="known launcher — clicking triggers a download")
                 plan.action_type = "click_download_open"
+            elif target_norm in self.DESTRUCTIVE_TARGETS:
+                log.warning("planner_blocked_destructive_click",
+                            target=plan.target,
+                            reason=(
+                                "destructive target during workflow — "
+                                "would destroy session / cancel work. "
+                                "Routing to HITL instead."
+                            ))
+                # Force HITL so the operator can confirm or correct.
+                plan.requires_hitl = True
+                plan.reason = (
+                    f"BLOCKED: agent tried to click {plan.target!r} which "
+                    f"destroys the active session. If you actually want to "
+                    f"end the task, click 'Stop task'. Otherwise give the "
+                    f"agent a corrected next step."
+                )
+                plan.confidence = 0.0
         return plan
 
     def _enforce_hitl_rules(self, plan: ActionPlan, retry_count: int) -> ActionPlan:
