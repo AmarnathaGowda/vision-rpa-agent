@@ -76,6 +76,11 @@ class ActionPlan(BaseModel):
     # action_type. Set explicitly to override (e.g. when "click" should hit a
     # desktop app instead of the browser).
     app: ExecutorScope = "auto"
+    # Optional keyboard modifiers for click actions ("Meta"=Cmd, "Control",
+    # "Alt", "Shift"). Required for Case 2 multi-row selection where rows
+    # 2-3 must Cmd+click to keep prior rows selected. Empty list = plain
+    # click (Case 1 path — unchanged behaviour).
+    modifiers: list[str] = []
 
     @model_validator(mode="before")
     @classmethod

@@ -17,6 +17,60 @@ from config.settings import settings
 
 log = get_logger(__name__)
 
+
+# ── Case 2 OCR field extractors (planner-side, no LLM) ───────────────────
+# Mirrors _extract_borrower_name / _extract_ocr_address / _extract_ocr_carrier
+# from legacy/automation/demo/run_case2_e2e_demo.py.
+
+def _extract_borrower(cleaned_lines: list[str]) -> str:
+    pats = [
+        r"our\s+client\s*[:\s]+([A-Za-z][A-Za-z .'-]{2,50})$",
+        r"insured\s+name\s*[:\s]+([A-Za-z][A-Za-z .'-]{2,50})$",
+        r"payee\s+name\s*[:\s]+([A-Za-z][A-Za-z .'-]{2,50})(?:\s*&|$)",
+        r"pay\s+to\s+(?:the\s+)?order\s+of\s*[:\s]+([A-Za-z][A-Za-z .'-]{2,50})(?:\s*&|$)",
+    ]
+    for line in cleaned_lines:
+        for p in pats:
+            m = re.search(p, line, re.IGNORECASE)
+            if m:
+                name = m.group(1).strip().rstrip(".,")
+                if len(name) > 3:
+                    return name.upper()
+    return ""
+
+
+def _extract_address(cleaned_lines: list[str]) -> str:
+    pat = re.compile(
+        r"\b(\d{3,5}\s+[A-Za-z][A-Za-z0-9\s]{2,35}"
+        r"(?:AVE|AVENUE|ST|STREET|CIR|CIRCLE|DR|DRIVE|BLVD|BOULEVARD|"
+        r"RD|ROAD|LN|LANE|WAY|PL|PLACE|CT|COURT|LOOP|TER|TERRACE|TRAIL|TRL))\b",
+        re.IGNORECASE,
+    )
+    for line in cleaned_lines:
+        m = pat.search(line)
+        if m:
+            return m.group(1).strip().upper()
+    return ""
+
+
+def _extract_carrier(cleaned_lines: list[str]) -> str:
+    pats = [
+        r"(tower\s+hill[a-z\s,\.]*(?:preferred|mutual|prime)?[a-z\s,\.]*(?:insurance|ins)[a-z\s,\.]*(?:company|co\.?)?)",
+        r"carrier\s*[:\s]+([A-Za-z][A-Za-z\s,\.&]{3,50}(?:insurance|ins)[A-Za-z\s,\.]*)",
+        r"insurer\s*[:\s]+([A-Za-z][A-Za-z\s,\.&]{3,50})",
+    ]
+    for line in cleaned_lines:
+        for p in pats:
+            m = re.search(p, line, re.IGNORECASE)
+            if m:
+                return m.group(1).strip().upper()
+    for line in cleaned_lines:
+        if re.search(r"\binsurance\b", line, re.IGNORECASE) and 8 < len(line) < 65:
+            clean = re.sub(r"[^\w\s,\.&]", " ", line).strip().upper()
+            if clean:
+                return clean
+    return ""
+
 PLANNING_PROMPT = """You are an RPA action planner for insurance claim automation.
 
 TASK GOAL: {goal}
@@ -363,7 +417,11 @@ class ActionPlanner:
         #   1. Click the Case 1 row (selects it)
         #   2. Click the Link in that row (opens PDF in new tab)
         #   3. Capture the popup URL as pdf_url
-        if (working.get("current_stage") == "document_management"
+        # NOTE: Case 1 ONLY. Case 2 uses multi-select + per-doc state
+        # machines (Rule 7 in _case2_plan), and case1-row would not match
+        # any Case 2 row anyway. Hard-gate to avoid accidental triggers.
+        if ((working.get("task_type") or "") == "case1"
+                and working.get("current_stage") == "document_management"
                 and "/document-management" in path_now):
             extracted = working.get("extracted_values") or {}
             if not extracted.get("pdf_url"):
@@ -508,6 +566,386 @@ class ActionPlanner:
                                 "the selected claim is Closed."),
                         confidence=1.0, requires_hitl=False, cache_hit=True,
                     )
+
+        # ── Case 2 guardrails (Rule 7) ────────────────────────────────
+        # Each Case 2 stage has a dedicated, gated guardrail. They run only
+        # when current_stage matches AND the task is case2 — Case 1 paths
+        # never enter this block.
+        if (working.get("task_type") or "").startswith("case2"):
+            c2 = self._case2_plan(working, path_now=path_now)
+            if c2 is not None:
+                return c2
+
+        return None
+
+    # ── Case 2 deterministic dispatcher ────────────────────────────────
+    CASE2_DOC_IDS = ("8184371", "8184373", "8184372")
+
+    def _case2_plan(self, working: dict, *, path_now: str = "") -> ActionPlan | None:  # noqa: C901
+        ev = working.get("extracted_values") or {}
+        stage = working.get("current_stage") or ""
+
+        # URL guard for ALL post-doc-mgmt sub-stages — if the LLM
+        # navigated us off /document-management between iterations
+        # (e.g. clicked "Search" thinking we wanted the Claim Search
+        # tab), come back before doing anything row-specific.
+        DM_STAGES = {"document_management", "multi_select", "pdf_capture",
+                     "claim_search"}
+        if stage in DM_STAGES and "/document-management" not in path_now:
+            # The fallback-chain inside claim_search owns its own
+            # navigation (proctor / claim-details URLs are legit). Do
+            # not yank us back if a fallback is active for this doc.
+            cs_state = ev.get("claim_search_state") or {}
+            if not (stage == "claim_search" and cs_state.get("fallback") == "iim"):
+                return ActionPlan(
+                    action_type="navigate",
+                    target="http://localhost:8000/lossdrafts/document-management",
+                    value="http://localhost:8000/lossdrafts/document-management",
+                    reason=(f"case2 guardrail: stage={stage} requires the "
+                            f"Document Management page; current URL is "
+                            f"'{path_now}' — navigate back."),
+                    confidence=1.0, requires_hitl=False, cache_hit=True,
+                )
+
+        # Stage 3: document_management — open the tab if not already there.
+        # Loop tracker flips document_management_open=true once the URL
+        # actually contains /document-management.
+        if stage == "document_management" and not ev.get("document_management_open"):
+            return ActionPlan(
+                action_type="click", target="ld-tab-document-management",
+                reason="case2 guardrail: open Document Management tab.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+
+        # Stage 4: multi_select — emit one click per row, modifiers=Meta for rows 2-3.
+        if stage == "multi_select":
+            state = ev.get("multi_select_state") or {"index": 0}
+            idx = int(state.get("index", 0))
+            if idx < len(self.CASE2_DOC_IDS):
+                doc_id = self.CASE2_DOC_IDS[idx]
+                modifiers = ["Meta"] if idx > 0 else []
+                return ActionPlan(
+                    action_type="click",
+                    target=f"ld-pending-doc-{doc_id}",
+                    modifiers=modifiers,
+                    reason=(f"case2 multi-select guardrail: click row "
+                            f"{idx+1}/3 (doc {doc_id})"
+                            + (" with Cmd held" if modifiers else "")),
+                    confidence=1.0, requires_hitl=False, cache_hit=True,
+                )
+
+        # Stage 5: pdf_capture — one tool call per doc.
+        if stage == "pdf_capture":
+            captured = ev.get("pdf_records") or []
+            idx = len(captured)
+            if idx < len(self.CASE2_DOC_IDS):
+                doc_id = self.CASE2_DOC_IDS[idx]
+                payload = json.dumps({"link_target": f"case2-link-{doc_id}",
+                                       "doc_id": doc_id})
+                return ActionPlan(
+                    action_type="extract",
+                    target="case2_open_pdf_capture",
+                    value=payload, app="tool",
+                    reason=(f"case2 pdf-capture guardrail: open PDF "
+                            f"{idx+1}/3 (doc {doc_id})."),
+                    confidence=1.0, requires_hitl=False, cache_hit=True,
+                )
+
+        # Stage 6: ocr_extract — one tool call per captured PDF.
+        if stage == "ocr_extract":
+            extractions = ev.get("extractions_by_doc") or {}
+            pdf_records = ev.get("pdf_records") or []
+            for rec in pdf_records:
+                if rec.get("doc_id") not in extractions:
+                    return ActionPlan(
+                        action_type="extract",
+                        target="case2_extract_pdf",
+                        value=rec.get("path", ""), app="tool",
+                        reason=(f"case2 ocr guardrail: extract PDF for "
+                                f"doc {rec.get('doc_id')}."),
+                        confidence=1.0, requires_hitl=False, cache_hit=True,
+                    )
+
+        # Stage 7: claim_search — per-doc state machine; on empty, switch
+        # the doc into an IIM fallback sub-machine.
+        if stage == "claim_search":
+            return self._case2_claim_search_plan(ev)
+
+        # Stage 8 (final): case2_evaluate — single tool call producing result.
+        if stage == "case2_evaluate" and not ev.get("case2_result"):
+            payload = json.dumps({
+                "selected_doc_ids": ev.get("selected_doc_ids") or list(self.CASE2_DOC_IDS),
+                "pdf_records": ev.get("pdf_records") or [],
+                "claim_search_outcomes": ev.get("claim_search_outcomes") or [],
+            })
+            return ActionPlan(
+                action_type="extract", target="case2_evaluate",
+                value=payload, app="tool",
+                reason="case2 evaluate guardrail: synthesize Case2FullResult.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+
+        # Once case2_result is set, declare task complete.
+        if ev.get("case2_result"):
+            return ActionPlan(
+                action_type="task_complete", target="",
+                reason=("Case 2 complete: "
+                        f"{ev['case2_result'].get('status')} "
+                        f"({ev['case2_result'].get('matched_count')}"
+                        f"/{ev['case2_result'].get('total_count')} matched)."),
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        return None
+
+    def _case2_claim_search_plan(self, ev: dict) -> ActionPlan | None:  # noqa: C901
+        """Per-doc Case 2 claim search + IIM fallback + stage-bridge chain.
+
+        State: ``claim_search_state = {"index", "step", "fallback", "fallback_step", "pending_loan_no", "iim_match", "claim_details"}``.
+        """
+        outcomes = ev.get("claim_search_outcomes") or []
+        extractions = ev.get("extractions_by_doc") or {}
+        state = ev.get("claim_search_state") or {"index": 0, "step": "type"}
+        idx = int(state.get("index", 0))
+
+        if idx >= len(self.CASE2_DOC_IDS):
+            return None
+        doc_id = self.CASE2_DOC_IDS[idx]
+        extraction = extractions.get(doc_id) or {}
+        candidates = extraction.get("candidates") or []
+
+        # Pick best candidate (header role preferred).
+        best = next((c for c in candidates if c.get("role") == "header"), None) \
+            or (candidates[0] if candidates else None)
+
+        # If no claim ID at all, skip straight to outcome record (loop absorber handles advancement).
+        if not best:
+            return ActionPlan(
+                action_type="js_eval",
+                target="case2_no_candidate_marker",
+                value=f"(() => 'no_candidate:{doc_id}')()",
+                reason=f"case2 claim_search: doc {doc_id} has no candidate — record empty outcome.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+
+        fallback = state.get("fallback")
+        if fallback == "iim":
+            return self._case2_iim_fallback_plan(ev, state, doc_id, extraction, best)
+
+        step = state.get("step", "type")
+        if step == "ensure_doc_mgmt":
+            return ActionPlan(
+                action_type="navigate",
+                target="http://localhost:8000/lossdrafts/document-management",
+                value="http://localhost:8000/lossdrafts/document-management",
+                reason="case2 claim_search: return to Document Management.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if step == "type":
+            return ActionPlan(
+                action_type="type", target="ld-doc-search-claim",
+                value=best.get("value", ""),
+                reason=(f"case2 claim_search: type claim ID for doc {doc_id} "
+                        f"({idx+1}/3)."),
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if step == "submit":
+            return ActionPlan(
+                action_type="click", target="ld-doc-search-submit",
+                reason="case2 claim_search: submit Claim Search.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if step == "probe":
+            return ActionPlan(
+                action_type="js_eval", target="claim_search_result_probe",
+                value=(
+                    "(() => {"
+                    " const empty = document.querySelector("
+                    "  \"[data-testid='ld-doc-claim-results-empty']\");"
+                    " if (empty) return 'empty';"
+                    " const row = document.querySelector("
+                    "  \"[data-testid^='ld-doc-claim-row-']\");"
+                    " if (row) {"
+                    "  const tid = row.getAttribute('data-testid')||'';"
+                    "  return 'found:' + tid.replace('ld-doc-claim-row-','');"
+                    " }"
+                    " return 'unknown';"
+                    "})()"
+                ),
+                reason="case2 claim_search: probe results panel.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if step == "select":
+            loan_no = state.get("pending_loan_no") or ""
+            return ActionPlan(
+                action_type="click",
+                target=f"ld-doc-claim-row-{loan_no}",
+                reason=(f"case2 claim_search: select matched loan "
+                        f"{loan_no} for doc {doc_id}."),
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        return None
+
+    def _case2_iim_fallback_plan(self, ev: dict, state: dict, doc_id: str,
+                                    extraction: dict, best: dict) -> ActionPlan | None:  # noqa: C901
+        """IIM fallback + stage bridge chain for a single Case 2 doc."""
+        sub = state.get("fallback_step", "extract_fields")
+        if sub == "extract_fields":
+            # Pure-Python regex pass over extraction["cleaned_lines"] —
+            # surfaced as a js_eval no-op so the loop's absorber picks it up.
+            cleaned = extraction.get("cleaned_lines") or []
+            borrower = _extract_borrower(cleaned)
+            address = _extract_address(cleaned)
+            carrier = _extract_carrier(cleaned)
+            payload = json.dumps({"borrower": borrower, "address": address,
+                                   "carrier": carrier, "doc_id": doc_id})
+            return ActionPlan(
+                action_type="js_eval",
+                target="case2_iim_fields_marker",
+                value=f"(() => {json.dumps(payload)})()",
+                reason=(f"case2 IIM fallback: extracted borrower/address/"
+                        f"carrier from OCR for doc {doc_id}."),
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "navigate":
+            return ActionPlan(
+                action_type="navigate",
+                target="http://localhost:8000/proctor/loan-search",
+                value="http://localhost:8000/proctor/loan-search",
+                reason="case2 IIM fallback: open Proctor Loan Search.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "type_first_name":
+            borrower = (state.get("iim_borrower") or "").strip()
+            first_name = borrower.split()[0] if borrower else ""
+            return ActionPlan(
+                action_type="type",
+                target="pf-input-contact-name",
+                value=first_name,
+                reason=(f"case2 IIM fallback: type first name '{first_name}' "
+                        f"for doc {doc_id}."),
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "submit":
+            return ActionPlan(
+                action_type="click", target="pf-btn-search",
+                reason="case2 IIM fallback: submit Proctor search.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "scrape_rows":
+            return ActionPlan(
+                action_type="extract", target="case2_scrape_iim_rows",
+                app="tool",
+                reason="case2 IIM fallback: scrape result rows.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "score":
+            payload = json.dumps({
+                "ocr_name": state.get("iim_borrower", ""),
+                "ocr_address": state.get("iim_address", ""),
+                "ocr_carrier": state.get("iim_carrier", ""),
+                "iim_rows": state.get("iim_rows", []),
+                "threshold": 60.0,
+            })
+            return ActionPlan(
+                action_type="extract", target="case2_fuzzy_score",
+                value=payload, app="tool",
+                reason="case2 IIM fallback: fuzzy score candidates.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "navigate_details":
+            loan_no = state.get("iim_best_loan_no", "")
+            url = f"http://localhost:8000/proctor/loan-details?loan_no={loan_no}"
+            return ActionPlan(
+                action_type="navigate", target=url, value=url,
+                reason=f"case2 IIM fallback: open loan details for {loan_no}.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "scrape_carrier":
+            return ActionPlan(
+                action_type="extract",
+                target="case2_scrape_loan_details_carrier", app="tool",
+                reason="case2 IIM fallback: scrape carrier from Loan Details.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "rescore":
+            payload = json.dumps({
+                "ocr_name": state.get("iim_borrower", ""),
+                "ocr_address": state.get("iim_address", ""),
+                "ocr_carrier": state.get("iim_carrier", ""),
+                "iim_rows": state.get("iim_rows", []),
+                "iim_carrier": state.get("iim_loan_details_carrier", ""),
+                "threshold": 60.0,
+            })
+            return ActionPlan(
+                action_type="extract", target="case2_fuzzy_score",
+                value=payload, app="tool",
+                reason="case2 IIM fallback: re-score with carrier.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+
+        # Stage-bridge sub-chain — loan_search → claim_details → letter →
+        # comm_history → claim_linking → doc_assignment.
+        if sub == "loan_search_navigate":
+            return ActionPlan(
+                action_type="navigate",
+                target="http://localhost:8000/lossdrafts/",
+                value="http://localhost:8000/lossdrafts/",
+                reason="case2 stage 8: navigate to Loss Drafts home.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "loan_search_type":
+            return ActionPlan(
+                action_type="type", target="ld-field-loan-no",
+                value=state.get("iim_best_loan_no", ""),
+                reason="case2 stage 8: type loan number.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "loan_search_submit":
+            return ActionPlan(
+                action_type="click", target="ld-search-submit",
+                reason="case2 stage 8: submit loan search.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "loan_search_open_details":
+            loan_no = state.get("iim_best_loan_no", "")
+            url = f"http://localhost:8000/lossdrafts/claim-details?loan_no={loan_no}"
+            return ActionPlan(
+                action_type="navigate", target=url, value=url,
+                reason=f"case2 stage 8: open Claim Details for {loan_no}.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "scrape_claim_details":
+            return ActionPlan(
+                action_type="extract", target="case2_scrape_claim_details",
+                app="tool",
+                reason="case2 stage 9: scrape Claim Details fields.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "letter_open_header":
+            return ActionPlan(
+                action_type="click",
+                target="ld-cd-letter-requests-header",
+                reason="case2 stage 10: expand Letter Requests section.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub == "letter_open_add":
+            return ActionPlan(
+                action_type="click", target="ld-cd-letter-requests-add",
+                reason="case2 stage 10: open Create Letter panel.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
+        if sub in ("run_stage7", "run_stage8", "run_stage9", "run_stage10"):
+            tool_target = f"case2_{sub}"
+            claim_data = state.get("claim_details") or {}
+            payload = json.dumps({**claim_data,
+                                   "loan_no": state.get("iim_best_loan_no", ""),
+                                   "doc_id": doc_id})
+            return ActionPlan(
+                action_type="extract", target=tool_target,
+                value=payload, app="tool",
+                reason=f"case2 stage bridge: {sub}.",
+                confidence=1.0, requires_hitl=False, cache_hit=True,
+            )
         return None
 
     def _known_targets_context(self) -> str:

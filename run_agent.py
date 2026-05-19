@@ -152,9 +152,11 @@ def _build_router(task: dict, agent_id: str):
 
     tool_executor = None
     if "tool" in scopes:
-        # Tool executor handles evaluation-only legacy handlers (Case 1).
+        # Tool executor handles legacy handlers + Case 2 stage bridges.
+        # Pass the BrowserExecutor so Case 2 tools that drive the page
+        # directly (stage7/8/9/10) can reach the live Playwright page.
         from executors.case1_tool import Case1ToolExecutor
-        tool_executor = Case1ToolExecutor()
+        tool_executor = Case1ToolExecutor(browser=browser_executor)
 
     router = ActionRouter(
         browser=browser_executor,

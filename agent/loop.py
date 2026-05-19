@@ -449,6 +449,13 @@ class AgentLoop:
             return False
         return True
 
+    # Case 2 stages whose planner output is 100% deterministic — perception
+    # is wasted compute (and a huge token cost on a vision LLM). The
+    # guardrail reads working memory + current URL, never the screenshot.
+    _CASE2_DETERMINISTIC_STAGES = frozenset({
+        "multi_select", "pdf_capture", "ocr_extract", "case2_evaluate",
+    })
+
     def _observe(self) -> ScreenState:
         assert self.working is not None and self.task_goal is not None
         # Deterministic mode: skip VLM perception entirely — the YAML drives steps.
@@ -461,6 +468,36 @@ class AgentLoop:
             log.info("perception_skipped",
                      step=self.working.step,
                      reason="deterministic_task")
+            self.audit.append("perception",
+                              task_id=self.working.task_id,
+                              step=self.working.step,
+                              screen=state.model_dump(),
+                              deterministic=True)
+            return state
+
+        # Case 2 deterministic-stage fast path: planner has a guardrail that
+        # produces the next action without looking at the screen. Skip the
+        # VLM call (saves ~5k tokens / step). Still capture the real URL so
+        # downstream URL guards work.
+        if ((self.working.task_type or "") == "case2"
+                and (self.working.current_stage or "") in self._CASE2_DETERMINISTIC_STAGES):
+            url_now = ""
+            try:
+                page = getattr(self.executor, "browser", None) and self.executor.browser.page
+                url_now = (page.url if page else "") or ""
+            except Exception:  # noqa: BLE001
+                pass
+            state = ScreenState(
+                app_type="browser",
+                state_summary=f"case2 deterministic stage: {self.working.current_stage}",
+                current_url=url_now,
+                confidence=1.0,
+            )
+            log.info("perception_skipped",
+                     step=self.working.step,
+                     stage=self.working.current_stage,
+                     reason="case2_deterministic_stage",
+                     url=url_now)
             self.audit.append("perception",
                               task_id=self.working.task_id,
                               step=self.working.step,
@@ -793,6 +830,303 @@ class AgentLoop:
                      verdict="Claim already closed",
                      matched=entry.get("claim_id"))
 
+    # ── Case 2 state machines ───────────────────────────────────────────
+    CASE2_DOC_IDS = ("8184371", "8184373", "8184372")
+
+    def _update_case2_state(self, plan: ActionPlan, result: ActionResult,
+                              screen: ScreenState) -> None:
+        """Single dispatcher for ALL Case 2 state transitions.
+
+        Stages handled:
+          - document_management → set document_management_open when URL matches.
+          - multi_select        → advance index after each successful Cmd+click.
+          - pdf_capture         → append to pdf_records on tool success.
+          - ocr_extract         → store extraction per doc_id on tool success.
+          - claim_search        → per-doc state machine + IIM fallback chain.
+          - case2_evaluate      → absorb case2_result and stop.
+
+        Gated on task_type so Case 1 is untouched.
+        """
+        if self.working is None or (self.working.task_type or "") != "case2":
+            return
+        ev = self.working.extracted_values
+
+        # URL-based: doc-mgmt open marker (independent of stage).
+        try:
+            from urllib.parse import urlparse
+            url_path = urlparse(screen.current_url or "").path or ""
+        except Exception:  # noqa: BLE001
+            url_path = ""
+        if "/document-management" in url_path and not ev.get("document_management_open"):
+            ev["document_management_open"] = True
+            log.info("case2_doc_mgmt_open", url=screen.current_url)
+
+        if result.status != "ok":
+            return
+        stage = self.working.current_stage or ""
+        target = (plan.target or "").lower()
+
+        # Multi-select progression.
+        if stage == "multi_select" and plan.action_type == "click" \
+                and "ld-pending-doc-" in target:
+            state = ev.setdefault("multi_select_state", {"index": 0})
+            state["index"] = int(state.get("index", 0)) + 1
+            if state["index"] >= len(self.CASE2_DOC_IDS):
+                ev["multi_select_done"] = True
+                ev["selected_doc_ids"] = list(self.CASE2_DOC_IDS)
+                log.info("case2_multi_select_done",
+                         selected=ev["selected_doc_ids"])
+            return
+
+        # PDF capture progression.
+        if stage == "pdf_capture" and plan.action_type == "extract" \
+                and target == "case2_open_pdf_capture":
+            payload = self._parse_tool_result(result)
+            if payload:
+                records = ev.setdefault("pdf_records", [])
+                records.append(payload)
+                if len(records) >= len(self.CASE2_DOC_IDS):
+                    ev["pdf_capture_done"] = True
+                    log.info("case2_pdf_capture_done",
+                             count=len(records))
+            return
+
+        # OCR extraction progression.
+        if stage == "ocr_extract" and plan.action_type == "extract" \
+                and target == "case2_extract_pdf":
+            payload = self._parse_tool_result(result)
+            if payload:
+                records = ev.get("pdf_records") or []
+                extractions = ev.setdefault("extractions_by_doc", {})
+                # Assume in-order extraction matches pdf_records order.
+                next_idx = len(extractions)
+                if next_idx < len(records):
+                    doc_id = records[next_idx].get("doc_id", f"doc_{next_idx}")
+                    extractions[doc_id] = payload
+                    log.info("case2_ocr_done",
+                             doc_id=doc_id,
+                             candidates=len(payload.get("candidates") or []),
+                             progress=f"{len(extractions)}/{len(records)}")
+                if len(extractions) >= len(self.CASE2_DOC_IDS):
+                    ev["ocr_extract_done"] = True
+            return
+
+        # Claim search per-doc state machine (+ IIM fallback chain).
+        if stage == "claim_search":
+            self._update_case2_claim_search(plan, result, ev)
+            return
+
+        # Final evaluate absorption.
+        if stage == "case2_evaluate" and plan.action_type == "extract" \
+                and target == "case2_evaluate":
+            payload = self._parse_tool_result(result)
+            if payload:
+                ev["case2_result"] = payload
+                log.info("case2_result_synthesized",
+                         status=payload.get("status"),
+                         matched=payload.get("matched_count"),
+                         total=payload.get("total_count"))
+            return
+
+    def _parse_tool_result(self, result: ActionResult) -> dict | None:
+        import json as _json
+        try:
+            payload = _json.loads(result.extracted_value or "")
+            return payload if isinstance(payload, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _update_case2_claim_search(self, plan: ActionPlan,
+                                     result: ActionResult, ev: dict) -> None:
+        """Drive the per-doc claim_search + IIM fallback state machine."""
+        target = (plan.target or "").lower()
+        state = ev.setdefault("claim_search_state",
+                              {"index": 0, "step": "type"})
+        idx = int(state.get("index", 0))
+        if idx >= len(self.CASE2_DOC_IDS):
+            return
+        doc_id = self.CASE2_DOC_IDS[idx]
+
+        # ── Main flow transitions ─────────────────────────────────────
+        if state.get("fallback") != "iim":
+            if plan.action_type == "navigate" \
+                    and "/document-management" in (plan.target or ""):
+                state["step"] = "type"
+                return
+            if plan.action_type == "type" and "ld-doc-search-claim" in target:
+                state["step"] = "submit"
+                return
+            if plan.action_type == "click" and "ld-doc-search-submit" in target:
+                state["step"] = "probe"
+                return
+            if plan.action_type == "js_eval" \
+                    and target == "claim_search_result_probe":
+                probe = (result.extracted_value or "").strip().strip('"')
+                if probe.startswith("found:"):
+                    state["pending_loan_no"] = probe.split(":", 1)[1]
+                    state["step"] = "select"
+                else:
+                    # empty / unknown → IIM fallback for this doc.
+                    state["fallback"] = "iim"
+                    state["fallback_step"] = "extract_fields"
+                return
+            if plan.action_type == "click" \
+                    and target.startswith("ld-doc-claim-row-"):
+                # Successful match path complete — record outcome, advance.
+                self._case2_record_outcome(ev, idx, doc_id, found=True,
+                                            loan_no=state.get("pending_loan_no"),
+                                            note=f"loan {state.get('pending_loan_no')} matched")
+                return
+            if plan.action_type == "js_eval" \
+                    and target == "case2_no_candidate_marker":
+                self._case2_record_outcome(ev, idx, doc_id, found=False,
+                                            loan_no=None,
+                                            note="no claim ID extracted")
+                return
+            return
+
+        # ── IIM fallback chain ─────────────────────────────────────────
+        sub = state.get("fallback_step", "extract_fields")
+        if sub == "extract_fields" and target == "case2_iim_fields_marker":
+            # Marker carries borrower/address/carrier as the embedded
+            # js_eval return value (a JSON string).
+            import json as _json
+            try:
+                inner = _json.loads(result.extracted_value or "")
+                # Returned by js_eval as a JSON string literal.
+                fields = _json.loads(inner) if isinstance(inner, str) else inner
+            except Exception:  # noqa: BLE001
+                fields = {}
+            state["iim_borrower"] = fields.get("borrower", "")
+            state["iim_address"] = fields.get("address", "")
+            state["iim_carrier"] = fields.get("carrier", "")
+            state["fallback_step"] = "navigate" if state["iim_borrower"] else "give_up"
+            if not state["iim_borrower"]:
+                self._case2_record_outcome(ev, idx, doc_id, found=False,
+                                            loan_no=None,
+                                            note="no borrower extractable for IIM")
+            return
+        if sub == "navigate" and plan.action_type == "navigate" \
+                and "/proctor/loan-search" in (plan.target or ""):
+            state["fallback_step"] = "type_first_name"
+            return
+        if sub == "type_first_name" and plan.action_type == "type":
+            state["fallback_step"] = "submit"
+            return
+        if sub == "submit" and plan.action_type == "click":
+            state["fallback_step"] = "scrape_rows"
+            return
+        if sub == "scrape_rows" and target == "case2_scrape_iim_rows":
+            try:
+                import json as _json
+                state["iim_rows"] = _json.loads(result.extracted_value or "[]")
+            except Exception:  # noqa: BLE001
+                state["iim_rows"] = []
+            state["fallback_step"] = "score" if state["iim_rows"] else "give_up"
+            if not state["iim_rows"]:
+                self._case2_record_outcome(ev, idx, doc_id, found=False,
+                                            loan_no=None, note="IIM: no rows")
+            return
+        if sub == "score" and target == "case2_fuzzy_score":
+            scored = self._parse_tool_result(result) or {}
+            best = scored.get("best") or {}
+            state["iim_best_loan_no"] = best.get("loan_no", "")
+            state["iim_best_score"] = best.get("overall", 0)
+            state["fallback_step"] = "navigate_details" if state["iim_best_loan_no"] else "give_up"
+            return
+        if sub == "navigate_details" and plan.action_type == "navigate" \
+                and "/proctor/loan-details" in (plan.target or ""):
+            state["fallback_step"] = "scrape_carrier"
+            return
+        if sub == "scrape_carrier" and target == "case2_scrape_loan_details_carrier":
+            state["iim_loan_details_carrier"] = (result.extracted_value or "").strip()
+            state["fallback_step"] = "rescore" if state["iim_loan_details_carrier"] else "loan_search_navigate"
+            return
+        if sub == "rescore" and target == "case2_fuzzy_score":
+            refined = self._parse_tool_result(result) or {}
+            best = refined.get("best") or {}
+            if best:
+                state["iim_best_score"] = best.get("overall", state.get("iim_best_score"))
+            state["fallback_step"] = "loan_search_navigate"
+            return
+        if sub == "loan_search_navigate" and plan.action_type == "navigate" \
+                and "/lossdrafts/" in (plan.target or "") \
+                and "/document-management" not in (plan.target or "") \
+                and "/claim-details" not in (plan.target or ""):
+            state["fallback_step"] = "loan_search_type"
+            return
+        if sub == "loan_search_type" and plan.action_type == "type" \
+                and "ld-field-loan-no" in target:
+            state["fallback_step"] = "loan_search_submit"
+            return
+        if sub == "loan_search_submit" and plan.action_type == "click" \
+                and "ld-search-submit" in target:
+            state["fallback_step"] = "loan_search_open_details"
+            return
+        if sub == "loan_search_open_details" and plan.action_type == "navigate" \
+                and "/claim-details" in (plan.target or ""):
+            state["fallback_step"] = "scrape_claim_details"
+            return
+        if sub == "scrape_claim_details" and target == "case2_scrape_claim_details":
+            state["claim_details"] = self._parse_tool_result(result) or {}
+            state["fallback_step"] = "letter_open_header"
+            return
+        if sub == "letter_open_header" and plan.action_type == "click" \
+                and "ld-cd-letter-requests-header" in target:
+            state["fallback_step"] = "letter_open_add"
+            return
+        if sub == "letter_open_add" and plan.action_type == "click" \
+                and "ld-cd-letter-requests-add" in target:
+            state["fallback_step"] = "run_stage7"
+            return
+        if sub == "run_stage7" and target == "case2_run_stage7":
+            state["fallback_step"] = "run_stage8"
+            return
+        if sub == "run_stage8" and target == "case2_run_stage8":
+            state["fallback_step"] = "run_stage9"
+            return
+        if sub == "run_stage9" and target == "case2_run_stage9":
+            state["fallback_step"] = "run_stage10"
+            return
+        if sub == "run_stage10" and target == "case2_run_stage10":
+            # End of fallback chain — record outcome as found via IIM.
+            self._case2_record_outcome(
+                ev, idx, doc_id, found=True,
+                loan_no=state.get("iim_best_loan_no"),
+                note=(f"IIM fallback → loan {state.get('iim_best_loan_no')} "
+                      f"(score {state.get('iim_best_score')})"),
+            )
+            return
+
+    def _case2_record_outcome(self, ev: dict, idx: int, doc_id: str, *,
+                                found: bool, loan_no: str | None,
+                                note: str) -> None:
+        """Append a ClaimSearchOutcome-shaped dict and advance the index."""
+        outcomes = ev.setdefault("claim_search_outcomes", [])
+        outcomes.append({"doc_id": doc_id, "found": found,
+                         "loan_no": loan_no, "note": note})
+        state = ev.setdefault("claim_search_state",
+                              {"index": 0, "step": "type"})
+        state["index"] = idx + 1
+        # Reset per-doc state for the next iteration.
+        for k in ("step", "fallback", "fallback_step", "pending_loan_no",
+                   "iim_rows", "iim_best_loan_no", "iim_best_score",
+                   "iim_borrower", "iim_address", "iim_carrier",
+                   "iim_loan_details_carrier", "claim_details"):
+            state.pop(k, None)
+        state["step"] = "type"
+        if len(outcomes) >= len(self.CASE2_DOC_IDS):
+            ev["claim_search_done"] = True
+        log.info("case2_outcome_recorded",
+                 doc_id=doc_id, found=found, loan_no=loan_no,
+                 note=note,
+                 progress=f"{len(outcomes)}/{len(self.CASE2_DOC_IDS)}")
+        self.audit.append("case2_outcome_recorded",
+                          task_id=self.working.task_id,
+                          step=self.working.step,
+                          doc_id=doc_id, found=found,
+                          loan_no=loan_no, note=note)
+
     # ── Deterministic stage advancement ─────────────────────────────────
     def _maybe_auto_advance_stage(self) -> None:
         """If the page URL now matches the current stage's exit pattern,
@@ -910,6 +1244,18 @@ class AgentLoop:
         # Claim-validation state machine — drives the per-candidate
         # type → submit → probe loop on stage claim_validation.
         self._update_validation_state(plan, result)
+
+        # Case 2 state machines (multi-select, pdf_capture, ocr, claim_search,
+        # IIM fallback, stage bridges, evaluate). Gated on task_type so
+        # Case 1 paths are untouched.
+        self._update_case2_state(plan, result, screen)
+
+        # Re-check stage gates AFTER trackers wrote new keys (e.g.
+        # multi_select_done, pdf_capture_done, claim_search_done). Without
+        # this second call, those data-based exits would always lag by
+        # one iteration and the LLM would hijack the gap. The earlier
+        # _maybe_auto_advance_stage call in _act covers URL-based exits.
+        self._maybe_auto_advance_stage()
 
         if result.status == "failed":
             key = str(step)

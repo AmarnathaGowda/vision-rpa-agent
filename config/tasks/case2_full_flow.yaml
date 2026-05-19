@@ -1,0 +1,106 @@
+# Case 2 — Multi-Record Selection + PDF / OCR / Claim Search (+ IIM + Stage 7-10).
+#
+# Mirrors the legacy demo at:
+#   legacy/automation/demo/run_case2_e2e_demo.py
+#
+# Run:
+#   poetry run python run_agent.py --task config/tasks/case2_full_flow.yaml
+#
+# Pre-requisites:
+#   1. Simulation server on :8000
+#   2. .env: RDWEB_USERNAME / RDWEB_PASSWORD
+#   3. SOPs ingested: poetry run python -m memory.ingest_sop docs/sop/
+#   4. RUNTIME_MODE=demo + LLM_PROVIDER=openai for reasonable latency.
+
+task_id: case2_full_flow
+task_type: case2
+app: browser
+
+goal: |
+  Execute the Case 2 (Multi-Record) workflow end-to-end against the local
+  simulation. ALWAYS START by navigating to
+  http://localhost:8000/rdweb/pages/en-US/login.aspx — entry point.
+
+  Case 2 selects 3 fixed records (doc IDs 8184371, 8184373, 8184372),
+  opens each PDF, OCRs them, then for each searches the extracted claim
+  ID in the Document Management Claim Search panel. If the claim is
+  found, click the matched row. If NOT found, fall through to the IIM
+  (Proctor) loan search → fuzzy match → standalone loan search → claim
+  details → letter request → communication history → claim linking →
+  document assignment.
+
+  Stages:
+    1. login                       SOP: sim-rdweb-login.md
+    2. loss_drafts_launch          SOP: case1-loss-drafts-launch.md  (shared)
+    3. document_management         SOP: case2-document-management.md
+    4. multi_select                SOP: case2-multi-select.md
+    5. pdf_capture                 SOP: case2-pdf-capture.md
+    6. ocr_extract                 SOP: case2-ocr-extract.md
+    7. claim_search                SOP: case2-claim-search.md
+    8. iim_fallback (conditional)  SOP: case2-iim-fallback.md
+    9. loan_search  (conditional)  SOP: case2-loan-search.md
+   10. claim_details (conditional) SOP: case2-claim-details.md
+   11. letter_request (conditional) SOP: case2-letter-request.md
+   12. comm_history  (conditional) SOP: case2-comm-history.md
+   13. claim_linking (conditional) SOP: case2-claim-linking.md
+   14. doc_assignment (conditional) SOP: case2-doc-assignment.md
+   15. case2_evaluate              SOP: case2-evaluate.md
+
+  Credentials available via {{RDWEB_USERNAME}} and {{RDWEB_PASSWORD}}.
+
+initial_stage: login
+
+# Fixed Case 2 record set — selection order matters (rows 2-3 Cmd+click).
+case2_doc_ids: ["8184371", "8184373", "8184372"]
+
+stages:
+  - name: login
+    exit_url_substring: /Default.aspx/Production
+    sets_keys: [rdweb_authenticated]
+    next: loss_drafts_launch
+  - name: loss_drafts_launch
+    exit_url_substring: /lossdrafts/
+    sets_keys: [lossdrafts_loaded]
+    next: document_management
+  - name: document_management
+    # NO URL-based exit — landing on /document-management does not mean
+    # the stage is complete; we still need to multi-select 3 rows.
+    exit_keys_set: [document_management_open]
+    sets_keys: []
+    next: multi_select
+  - name: multi_select
+    # Loop's _update_case2_multi_select sets this once 3 rows are clicked.
+    exit_keys_set: [multi_select_done]
+    sets_keys: []
+    next: pdf_capture
+  - name: pdf_capture
+    # Loop's _update_case2_pdf_capture sets this once 3 PDFs captured.
+    exit_keys_set: [pdf_capture_done]
+    sets_keys: []
+    next: ocr_extract
+  - name: ocr_extract
+    # Loop sets ocr_extract_done once 3 extractions absorbed.
+    exit_keys_set: [ocr_extract_done]
+    sets_keys: []
+    next: claim_search
+  - name: claim_search
+    # Loop sets claim_search_done once 3 outcomes recorded.
+    # Each outcome triggers IIM-fallback chain if not found.
+    exit_keys_set: [claim_search_done]
+    sets_keys: []
+    next: case2_evaluate
+  - name: case2_evaluate
+    exit_keys_set: [case2_result]
+    sets_keys: []
+    next: ""
+
+done_when:
+  all_set:
+    - rdweb_authenticated   # stage 1
+    - lossdrafts_loaded     # stage 2
+    - document_management_open  # stage 3
+    - multi_select_done     # stage 4
+    - pdf_capture_done      # stage 5
+    - ocr_extract_done      # stage 6
+    - claim_search_done     # stage 7
+    - case2_result          # stage 15

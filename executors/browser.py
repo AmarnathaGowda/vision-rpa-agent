@@ -225,7 +225,8 @@ class BrowserExecutor:
             self.navigate(resolved_value or plan.target)
             return "", self._snap(plan)
         if plan.action_type == "click":
-            self.click(plan.target, fallback=plan.fallback)
+            self.click(plan.target, fallback=plan.fallback,
+                       modifiers=plan.modifiers or None)
             return "", self._snap(plan)
         if plan.action_type == "click_download_open":
             launch_url = self.click_download_open(plan.target, fallback=plan.fallback)
@@ -262,22 +263,21 @@ class BrowserExecutor:
                        timeout=self.DEFAULT_TIMEOUT_MS * 2)
         log.info("browser_navigate", url=url)
 
-    def click(self, target: str, fallback: str | None = None) -> None:
+    def click(self, target: str, fallback: str | None = None,
+                modifiers: list[str] | None = None) -> None:
         sel = self.resolver.resolve(self.page, target, fallback=fallback)
-        # no_wait_after=True — don't block waiting for navigation that the
-        # click might trigger. The next perception iteration will see the
-        # new page state. Slow simulators / SSO redirects would otherwise
-        # exceed DEFAULT_TIMEOUT_MS even though the click itself worked.
+        kwargs: dict = {"timeout": self.DEFAULT_TIMEOUT_MS}
+        if modifiers:
+            kwargs["modifiers"] = list(modifiers)
         try:
             self.page.locator(sel.selector).first.click(
-                timeout=self.DEFAULT_TIMEOUT_MS,
-                no_wait_after=True,
+                no_wait_after=True, **kwargs,
             )
         except TypeError:
-            # Older Playwright API may not accept no_wait_after on Locator.click
-            # — fall back without the kwarg.
-            self.page.locator(sel.selector).first.click(timeout=self.DEFAULT_TIMEOUT_MS)
-        log.info("browser_click", target=target, selector=sel.selector, strategy=sel.strategy)
+            self.page.locator(sel.selector).first.click(**kwargs)
+        log.info("browser_click", target=target, selector=sel.selector,
+                 strategy=sel.strategy,
+                 modifiers=list(modifiers) if modifiers else [])
 
     def click_download_open(self, target: str,
                               fallback: str | None = None) -> str:

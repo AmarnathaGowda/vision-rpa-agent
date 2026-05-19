@@ -32,7 +32,7 @@ class OpenAIProvider:
         model: str = "gpt-4o-mini",
         base_url: str = "https://api.openai.com/v1",
         timeout: float = 30.0,
-        max_retries: int = 3,
+        max_retries: int = 8,
     ) -> None:
         from openai import OpenAI
 
@@ -80,8 +80,9 @@ class OpenAIProvider:
         for attempt in Retrying(
             retry=retry_if_exception_type(transient),
             stop=stop_after_attempt(self._max_retries + 1),
-            # 1, 2, 4, 8, … up to 30s — covers a typical 429 backoff window.
-            wait=wait_exponential(multiplier=1, min=2, max=30),
+            # 2, 4, 8, 16, 30, 60, 60, 60, 60 — total ~5min, enough to
+            # ride out a full TPM-minute reset on bursty demos.
+            wait=wait_exponential(multiplier=1, min=2, max=60),
             reraise=True,
         ):
             with attempt:
